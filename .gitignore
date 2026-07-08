@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
