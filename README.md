@@ -1,5 +1,7 @@
 # 随问 (random ask)
 
+> 当前分支：`chn-version`，这是中文版本（chn version）。
+
 随问（random ask）是一个 Windows 桌面浮窗原型：点击浮窗后可以在原应用里拖选文本并自动复制提问，也可以拖拽框选屏幕区域，将截图发送给支持视觉的 LLM 进行解答。
 
 ## 使用方式
