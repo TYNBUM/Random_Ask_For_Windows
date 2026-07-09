@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Callable, Optional
 import tkinter as tk
 from tkinter import messagebox
 
-from PIL import Image, ImageDraw, ImageGrab, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageGrab, ImageTk
 from openai import OpenAI
 
 try:
@@ -89,22 +90,33 @@ def send_ctrl_c() -> None:
 
 THEME = {
     "transparent": "#ff00ff",
-    "panel": "#070914",
-    "panel_deep": "#02040a",
-    "panel_2": "#111827",
-    "panel_3": "#182033",
-    "line": "#00f5ff",
-    "line_2": "#ff2bd6",
-    "warn": "#fff23d",
-    "ink": "#edf7ff",
-    "muted": "#8d99ae",
-    "grid": "#1b2540",
-    "red": "#ff3b6b",
-    "teal": "#00f5d4",
-    "blue": "#2f7dff",
-    "green": "#35ff9c",
-    "violet": "#a855ff",
-    "orange": "#ff8a1f",
+    "panel": "#f7fbff",
+    "panel_deep": "#eef4fb",
+    "panel_2": "#fbfdff",
+    "panel_3": "#e5edf7",
+    "glass_underlay": "#dfeaf7",
+    "glass_fill": "#f9fcff",
+    "glass_inner": "#ffffff",
+    "glass_edge": "#ffffff",
+    "glass_shadow": "#b8c7d8",
+    "glass_shadow_soft": "#d8e2ee",
+    "line": "#6aa7ff",
+    "line_2": "#b4d5ff",
+    "warn": "#f4b642",
+    "ink": "#172033",
+    "muted": "#657187",
+    "grid": "#dce8f5",
+    "field": "#edf4f9",
+    "field_glass": "#eaf2f8",
+    "field_glass_edge": "#f8fbff",
+    "field_outer": "#515b66",
+    "selection": "#cfe3ff",
+    "red": "#ff5f57",
+    "teal": "#18b7a6",
+    "blue": "#3f8cff",
+    "green": "#30c16b",
+    "violet": "#8f7cff",
+    "orange": "#ff9f0a",
 }
 
 
@@ -155,6 +167,341 @@ def draw_round_rect(
     return canvas.create_polygon(points, smooth=True, splinesteps=18, **kwargs)
 
 
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def blend_color(start: str, end: str, amount: float) -> str:
+    amount = max(0.0, min(1.0, amount))
+    sr, sg, sb = _hex_to_rgb(start)
+    er, eg, eb = _hex_to_rgb(end)
+    return _rgb_to_hex(
+        (
+            round(sr + (er - sr) * amount),
+            round(sg + (eg - sg) * amount),
+            round(sb + (eb - sb) * amount),
+        )
+    )
+
+
+def make_rounded_mask(size: tuple[int, int], rect: tuple[int, int, int, int], radius: int) -> Image.Image:
+    area = size[0] * size[1]
+    scale = 4 if area <= 50000 else 2
+    scaled_size = (size[0] * scale, size[1] * scale)
+    scaled_rect = tuple(value * scale for value in rect)
+    mask = Image.new("L", scaled_size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle(scaled_rect, radius=radius * scale, fill=255)
+    return mask.resize(size, Image.Resampling.LANCZOS)
+
+
+def make_edge_mask(mask: Image.Image, thickness: int) -> Image.Image:
+    thickness = max(1, min(thickness, 18))
+    kernel_size = max(3, thickness * 2 + 1)
+    eroded = mask.filter(ImageFilter.MinFilter(kernel_size))
+    edge = ImageChops.subtract(mask, eroded)
+    return edge.filter(ImageFilter.GaussianBlur(max(0.6, thickness / 3)))
+
+
+def make_fine_rim_mask(mask: Image.Image, thickness: int = 1, blur: float = 0.45) -> Image.Image:
+    thickness = max(1, thickness)
+    kernel_size = max(3, thickness * 2 + 1)
+    eroded = mask.filter(ImageFilter.MinFilter(kernel_size))
+    rim = ImageChops.subtract(mask, eroded)
+    if blur > 0:
+        rim = rim.filter(ImageFilter.GaussianBlur(blur))
+    return rim
+
+
+def scaled_alpha(mask: Image.Image, scale: float, cap: int = 255) -> Image.Image:
+    return mask.point(lambda value: min(cap, int(value * scale)))
+
+
+def create_fallback_backdrop(width: int, height: int) -> Image.Image:
+    image = Image.new("RGB", (width, height), THEME["panel_deep"])
+    draw = ImageDraw.Draw(image)
+    for y in range(height):
+        amount = y / max(1, height - 1)
+        color = blend_color("#dce9f7", "#f8fbff", amount)
+        draw.line((0, y, width, y), fill=color)
+    draw.ellipse((-width // 4, -height, width // 2, height), fill="#d3e6ff")
+    draw.ellipse((width // 2, height // 4, width + width // 4, height + height // 2), fill="#f2eaff")
+    return image
+
+
+def grab_screen_region(x: int, y: int, width: int, height: int) -> Optional[Image.Image]:
+    try:
+        try:
+            return ImageGrab.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+        except TypeError:
+            return ImageGrab.grab(bbox=(x, y, x + width, y + height))
+    except Exception:
+        return None
+
+
+def get_virtual_screen_bounds(root: tk.Tk) -> tuple[int, int, int, int]:
+    if os.name == "nt":
+        user32 = ctypes.windll.user32
+        left = int(user32.GetSystemMetrics(76))  # SM_XVIRTUALSCREEN
+        top = int(user32.GetSystemMetrics(77))  # SM_YVIRTUALSCREEN
+        width = int(user32.GetSystemMetrics(78))  # SM_CXVIRTUALSCREEN
+        height = int(user32.GetSystemMetrics(79))  # SM_CYVIRTUALSCREEN
+        if width > 0 and height > 0:
+            return left, top, width, height
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def crop_from_screen_snapshot(
+    snapshot: Image.Image,
+    origin: tuple[int, int],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> Image.Image:
+    left = x - origin[0]
+    top = y - origin[1]
+    right = left + width
+    bottom = top + height
+    if left >= 0 and top >= 0 and right <= snapshot.width and bottom <= snapshot.height:
+        return snapshot.crop((left, top, right, bottom))
+
+    fallback = create_fallback_backdrop(width, height)
+    src_left = max(0, left)
+    src_top = max(0, top)
+    src_right = min(snapshot.width, right)
+    src_bottom = min(snapshot.height, bottom)
+    if src_right > src_left and src_bottom > src_top:
+        patch = snapshot.crop((src_left, src_top, src_right, src_bottom))
+        fallback.paste(patch, (src_left - left, src_top - top))
+    return fallback
+
+
+def make_liquid_glass_bitmap(
+    width: int,
+    height: int,
+    screen_image: Optional[Image.Image],
+    accent: str = THEME["line"],
+    transparent_outside: bool = False,
+    radius: Optional[int] = None,
+    blur_radius: int = 18,
+    frost_alpha: int = 42,
+    tint_alpha: int = 18,
+    brightness: float = 1.14,
+    compact_highlight: bool = False,
+    clean_highlight: bool = False,
+    shell_rect_override: Optional[tuple[int, int, int, int]] = None,
+) -> Image.Image:
+    transparent_rgb = _hex_to_rgb(THEME["transparent"])
+    shell_rect = shell_rect_override or (5, 5, width - 5, height - 7)
+    shell_radius = radius if radius is not None else max(1, (shell_rect[3] - shell_rect[1]) // 2)
+    shell_radius = max(1, min(shell_radius, (shell_rect[2] - shell_rect[0]) // 2, (shell_rect[3] - shell_rect[1]) // 2))
+
+    if width * height > 160000:
+        render_scale = 0.42 if width * height > 250000 else 0.55
+        small_width = max(1, round(width * render_scale))
+        small_height = max(1, round(height * render_scale))
+        small_rect = tuple(max(0, round(value * render_scale)) for value in shell_rect)
+        small_radius = max(1, round(shell_radius * render_scale))
+        small_screen = None
+        if screen_image is not None:
+            small_screen = screen_image.convert("RGB").resize((small_width, small_height), Image.Resampling.BILINEAR)
+        small = make_liquid_glass_bitmap(
+            small_width,
+            small_height,
+            small_screen,
+            accent=accent,
+            transparent_outside=True,
+            radius=small_radius,
+            blur_radius=max(1, round(blur_radius * render_scale)),
+            frost_alpha=frost_alpha,
+            tint_alpha=tint_alpha,
+            brightness=brightness,
+            compact_highlight=compact_highlight,
+            clean_highlight=clean_highlight,
+            shell_rect_override=small_rect,
+        )
+        scaled = small.resize((width, height), Image.Resampling.BICUBIC)
+        if transparent_outside:
+            return scaled
+        alpha = scaled.getchannel("A").point(lambda value: 255 if value >= 128 else 0)
+        scaled.putalpha(alpha)
+        output = Image.new("RGBA", (width, height), (*transparent_rgb, 255))
+        output.alpha_composite(scaled)
+        return output.convert("RGB")
+
+    mask = make_rounded_mask((width, height), shell_rect, shell_radius)
+    edge_mask = make_edge_mask(mask, max(3, min(width, height) // 6))
+
+    if screen_image is None:
+        backdrop = create_fallback_backdrop(width, height)
+    else:
+        backdrop = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+
+    # Layer 1: blurred backdrop seen through the capsule.
+    glass = backdrop.filter(ImageFilter.GaussianBlur(blur_radius))
+    glass = ImageEnhance.Color(glass).enhance(0.82)
+    glass = ImageEnhance.Contrast(glass).enhance(0.94)
+    glass = ImageEnhance.Brightness(glass).enhance(brightness).convert("RGBA")
+
+    # Liquid-glass refraction: magnify the source only through the thick edge band.
+    pad_x = min(max(3, width // 20), 24)
+    pad_y = min(max(4, height // 4), 18)
+    refracted = backdrop.resize((width + pad_x * 2, height + pad_y * 2), Image.Resampling.BICUBIC)
+    refracted = refracted.crop((pad_x, pad_y, pad_x + width, pad_y + height))
+    refracted = ImageEnhance.Contrast(refracted).enhance(1.16)
+    refracted = ImageEnhance.Brightness(refracted).enhance(1.05)
+    refracted = refracted.filter(ImageFilter.GaussianBlur(max(1, blur_radius // 5))).convert("RGBA")
+    refracted.putalpha(scaled_alpha(edge_mask, 0.88, 218))
+    glass.alpha_composite(refracted)
+
+    # Layer 2: frosted material tint. Kept deliberately light so the backdrop still reads through it.
+    body = Image.new("RGBA", (width, height), (255, 255, 255, frost_alpha))
+    glass.alpha_composite(body)
+    tint_rgb = _hex_to_rgb(accent)
+    tint = Image.new("RGBA", (width, height), (*tint_rgb, tint_alpha))
+    glass.alpha_composite(tint)
+
+    top_alpha = Image.new("L", (width, height), 0)
+    top_draw = ImageDraw.Draw(top_alpha)
+    for y_pos in range(height):
+        top_draw.line((0, y_pos, width, y_pos), fill=int(128 * (1 - y_pos / max(1, height - 1))))
+    top_alpha = ImageChops.multiply(edge_mask, top_alpha)
+    edge_light = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+    edge_light.putalpha(top_alpha)
+    glass.alpha_composite(edge_light)
+
+    bottom_alpha = Image.new("L", (width, height), 0)
+    bottom_draw = ImageDraw.Draw(bottom_alpha)
+    for y_pos in range(height):
+        bottom_draw.line((0, y_pos, width, y_pos), fill=int(76 * (y_pos / max(1, height - 1))))
+    bottom_alpha = ImageChops.multiply(edge_mask, bottom_alpha)
+    edge_shadow = Image.new("RGBA", (width, height), (35, 45, 62, 0))
+    edge_shadow.putalpha(bottom_alpha)
+    glass.alpha_composite(edge_shadow)
+
+    # Layer 3: specular highlights and refractive edge catches.
+    rim_mask = make_fine_rim_mask(mask, 1 if clean_highlight else 2, 0.45 if clean_highlight else 0.65)
+    rim_alpha = scaled_alpha(rim_mask, 0.54 if clean_highlight else 0.76, 138 if clean_highlight else 204)
+    rim = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+    rim.putalpha(rim_alpha)
+    glass.alpha_composite(rim)
+
+    shine = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(shine)
+    if clean_highlight:
+        pass
+    elif compact_highlight:
+        draw.line(
+            (
+                shell_rect[0] + 12,
+                shell_rect[1] + 9,
+                shell_rect[2] - 12,
+                shell_rect[1] + 7,
+            ),
+            fill=(255, 255, 255, 150),
+            width=2,
+        )
+        draw.line(
+            (
+                shell_rect[0] + 16,
+                shell_rect[3] - 8,
+                shell_rect[2] - 16,
+                shell_rect[3] - 9,
+            ),
+            fill=(*tint_rgb, 70),
+            width=1,
+        )
+    else:
+        draw.rounded_rectangle(
+            (shell_rect[0] + 3, shell_rect[1] + 3, shell_rect[2] - 3, shell_rect[3] - 3),
+            radius=max(1, shell_radius - 3),
+            outline=(255, 255, 255, 118),
+            width=1,
+        )
+        draw.arc(
+            (shell_rect[0] + 7, shell_rect[1] + 7, shell_rect[0] + 118, shell_rect[3] - 5),
+            start=102,
+            end=248,
+            fill=(255, 255, 255, 210),
+            width=3,
+        )
+        draw.arc(
+            (shell_rect[2] - 132, shell_rect[1] + 8, shell_rect[2] - 8, shell_rect[3] - 4),
+            start=292,
+            end=24,
+            fill=(*tint_rgb, 136),
+            width=2,
+        )
+        draw.line(
+            (shell_rect[0] + 38, shell_rect[1] + 12, shell_rect[2] - 44, shell_rect[1] + 9),
+            fill=(255, 255, 255, 170),
+            width=2,
+        )
+        draw.line(
+            (shell_rect[0] + 54, shell_rect[3] - 10, shell_rect[2] - 62, shell_rect[3] - 13),
+            fill=(*tint_rgb, 92),
+            width=2,
+        )
+    glass.alpha_composite(shine)
+
+    glass.putalpha(mask)
+    if transparent_outside:
+        return glass
+    mask = mask.point(lambda value: 255 if value >= 128 else 0)
+    glass.putalpha(mask)
+    output = Image.new("RGBA", (width, height), (*transparent_rgb, 255))
+    output.alpha_composite(glass)
+    return output.convert("RGB")
+
+
+def draw_liquid_glass_round_rect(
+    canvas: tk.Canvas,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    radius: int,
+    fill: str = THEME["glass_fill"],
+    outline: str = THEME["glass_edge"],
+    tint: str = THEME["line"],
+    width: int = 1,
+) -> None:
+    height = max(1, y2 - y1)
+    radius = max(1, min(radius, (x2 - x1) // 2, height // 2))
+
+    # Layer 1: depth and blurred backdrop color, approximated with soft stacked shapes.
+    draw_round_rect(
+        canvas,
+        x1 + 1,
+        y1 + 6,
+        x2 - 1,
+        y2 + 4,
+        radius,
+        fill=THEME["glass_shadow_soft"],
+        outline="",
+    )
+    draw_round_rect(
+        canvas,
+        x1 + 3,
+        y1 + 3,
+        x2 - 3,
+        y2 + 2,
+        radius,
+        fill=THEME["glass_underlay"],
+        outline="",
+    )
+
+    # Layer 2: frosted body with a neutral rim only.
+    rim = blend_color(THEME["glass_shadow"], fill, 0.62)
+    draw_round_rect(canvas, x1, y1, x2, y2, radius, fill=fill, outline=rim, width=width)
+
+
 def draw_capsule(
     canvas: tk.Canvas,
     x1: int,
@@ -165,20 +512,21 @@ def draw_capsule(
     outline: str,
     width: int = 2,
 ) -> None:
-    height = max(1, y2 - y1)
-    radius = height // 2
-    left = x1 + radius
-    right = x2 - radius
-    canvas.create_rectangle(left, y1, right, y2, fill=fill, outline="")
-    canvas.create_oval(x1, y1, x1 + height, y2, fill=fill, outline="")
-    canvas.create_oval(x2 - height, y1, x2, y2, fill=fill, outline="")
-    canvas.create_arc(x1, y1, x1 + height, y2, start=90, extent=180, outline=outline, width=width, style="arc")
-    canvas.create_arc(x2 - height, y1, x2, y2, start=-90, extent=180, outline=outline, width=width, style="arc")
-    canvas.create_line(left, y1, right, y1, fill=outline, width=width)
-    canvas.create_line(left, y2, right, y2, fill=outline, width=width)
+    draw_liquid_glass_round_rect(
+        canvas,
+        x1,
+        y1,
+        x2,
+        y2,
+        max(1, (y2 - y1) // 2),
+        fill=fill,
+        outline=outline,
+        tint=outline,
+        width=width,
+    )
 
 
-def draw_neon_round_rect(
+def draw_glass_panel(
     canvas: tk.Canvas,
     x1: int,
     y1: int,
@@ -187,217 +535,10 @@ def draw_neon_round_rect(
     radius: int,
     fill: str,
     outline: str,
-    glow: str,
+    tint: str,
     width: int = 2,
 ) -> None:
-    for offset, glow_width in ((5, 1), (3, 1)):
-        draw_round_rect(
-            canvas,
-            x1 - offset,
-            y1 - offset,
-            x2 + offset,
-            y2 + offset,
-            radius + offset,
-            fill="",
-            outline=glow,
-            width=glow_width,
-        )
-    draw_round_rect(canvas, x1, y1, x2, y2, radius, fill=fill, outline=outline, width=width)
-    draw_round_rect(
-        canvas,
-        x1 + 5,
-        y1 + 5,
-        x2 - 5,
-        y2 - 5,
-        max(1, radius - 5),
-        fill="",
-        outline="#16233c",
-        width=1,
-    )
-
-
-def draw_scanlines(
-    canvas: tk.Canvas,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    step: int = 7,
-    color: str = THEME["grid"],
-) -> None:
-    for y in range(y1, y2, step):
-        canvas.create_line(x1, y, x2, y, fill=color, width=1)
-
-
-def draw_corner_brackets(
-    canvas: tk.Canvas,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    color: str,
-    length: int = 18,
-) -> None:
-    corners = [
-        (x1, y1, 1, 1),
-        (x2, y1, -1, 1),
-        (x1, y2, 1, -1),
-        (x2, y2, -1, -1),
-    ]
-    for x, y, sx, sy in corners:
-        canvas.create_line(x, y, x + sx * length, y, fill=color, width=2, capstyle="round")
-        canvas.create_line(x, y, x, y + sy * length, fill=color, width=2, capstyle="round")
-
-
-def draw_circuit_trace(
-    canvas: tk.Canvas,
-    points: list[tuple[int, int]],
-    color: str,
-    node_color: str = THEME["warn"],
-    width: int = 2,
-) -> None:
-    for start, end in zip(points, points[1:]):
-        canvas.create_line(*start, *end, fill=color, width=width, capstyle="round")
-    for x, y in points:
-        canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=node_color, outline="")
-
-
-def draw_panel_shell(
-    canvas: tk.Canvas,
-    width: int,
-    height: int,
-    radius: int,
-    accent: str = THEME["line"],
-    glow: str = "#07323b",
-    fill: str = THEME["panel"],
-    scan: bool = True,
-) -> None:
-    draw_neon_round_rect(canvas, 5, 6, width - 5, height - 6, radius, fill, accent, glow, width=2)
-    if scan:
-        draw_scanlines(canvas, 16, 14, width - 16, height - 14, step=8)
-    draw_corner_brackets(canvas, 17, 18, width - 17, height - 18, THEME["line_2"], length=14)
-    canvas.create_line(30, 12, 92, 12, fill=THEME["warn"], width=3, capstyle="round")
-    canvas.create_line(width - 106, height - 12, width - 42, height - 12, fill=accent, width=3, capstyle="round")
-
-
-def draw_film_icon(
-    canvas: tk.Canvas,
-    x: int,
-    y: int,
-    size: int,
-    color: str = THEME["ink"],
-    accent: str = THEME["line"],
-) -> None:
-    w = size
-    h = int(size * 0.68)
-    draw_round_rect(canvas, x - 1, y - 1, x + w + 1, y + h + 1, 6, fill="", outline="#143347", width=3)
-    draw_round_rect(canvas, x, y, x + w, y + h, 5, fill="#09111e", outline=color, width=2)
-    hole_w = max(3, size // 9)
-    hole_h = max(3, size // 8)
-    for i in range(3):
-        yy = y + 5 + i * ((h - 10) // 2)
-        canvas.create_rectangle(x + 4, yy, x + 4 + hole_w, yy + hole_h, fill=accent, outline="")
-        canvas.create_rectangle(
-            x + w - 4 - hole_w,
-            yy,
-            x + w - 4,
-            yy + hole_h,
-            fill=accent,
-            outline="",
-        )
-    canvas.create_line(x + 12, y + h - 8, x + w - 12, y + 8, fill=THEME["line_2"], width=2)
-    canvas.create_line(x + 14, y + 6, x + w - 12, y + h - 6, fill=accent, width=1)
-
-
-def draw_speaker_icon(
-    canvas: tk.Canvas,
-    x: int,
-    y: int,
-    size: int,
-    color: str = THEME["ink"],
-    accent: str = THEME["teal"],
-) -> None:
-    canvas.create_oval(x - 2, y - 2, x + size + 2, y + size + 2, outline="#0b3440", width=3)
-    canvas.create_oval(x, y, x + size, y + size, fill="#08111f", outline=color, width=2)
-    pad = max(4, size // 7)
-    canvas.create_oval(x + pad, y + pad, x + size - pad, y + size - pad, outline=accent, width=2)
-    canvas.create_oval(
-        x + pad * 2,
-        y + pad * 2,
-        x + size - pad * 2,
-        y + size - pad * 2,
-        outline=THEME["line_2"],
-        width=1,
-    )
-    pad2 = max(9, size // 3)
-    canvas.create_oval(x + pad2, y + pad2, x + size - pad2, y + size - pad2, fill=color, outline="")
-    canvas.create_arc(x + 4, y + 4, x + size - 4, y + size - 4, start=35, extent=70, outline=THEME["warn"], width=2)
-
-
-def draw_tv_icon(
-    canvas: tk.Canvas,
-    x: int,
-    y: int,
-    size: int,
-    color: str = THEME["ink"],
-    accent: str = THEME["blue"],
-) -> None:
-    body_h = int(size * 0.68)
-    draw_round_rect(canvas, x - 1, y + 4, x + size + 1, y + 6 + body_h, 8, fill="#08111f", outline="#18304e", width=3)
-    draw_round_rect(canvas, x, y + 5, x + size, y + 5 + body_h, 7, fill="#0d1524", outline=color, width=2)
-    draw_round_rect(
-        canvas,
-        x + 6,
-        y + 11,
-        x + size - 15,
-        y + body_h,
-        5,
-        fill="",
-        outline=accent,
-        width=2,
-    )
-    for yy in range(y + 15, y + body_h - 1, 4):
-        canvas.create_line(x + 9, yy, x + size - 18, yy, fill="#1a3553", width=1)
-    knob_x = x + size - 10
-    canvas.create_oval(knob_x - 3, y + 17, knob_x + 3, y + 23, fill=THEME["warn"], outline="")
-    canvas.create_oval(knob_x - 3, y + 29, knob_x + 3, y + 35, fill=color, outline="")
-    canvas.create_line(x + 10, y + size - 4, x + 16, y + body_h + 5, fill=color, width=2)
-    canvas.create_line(x + size - 10, y + size - 4, x + size - 16, y + body_h + 5, fill=color, width=2)
-
-
-def draw_gear_icon(
-    canvas: tk.Canvas,
-    x: int,
-    y: int,
-    size: int,
-    color: str = THEME["ink"],
-    accent: str = THEME["red"],
-) -> None:
-    cx = x + size / 2
-    cy = y + size / 2
-    outer = size * 0.43
-    inner = size * 0.25
-    for i in range(10):
-        angle = math.tau * i / 10
-        x1 = cx + math.cos(angle) * inner
-        y1 = cy + math.sin(angle) * inner
-        x2 = cx + math.cos(angle) * outer
-        y2 = cy + math.sin(angle) * outer
-        canvas.create_line(x1, y1, x2, y2, fill="#3b1430", width=5, capstyle="round")
-        canvas.create_line(x1, y1, x2, y2, fill=color, width=2, capstyle="round")
-    canvas.create_oval(cx - inner, cy - inner, cx + inner, cy + inner, fill="#0a101c", outline=color, width=2)
-    canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=accent, outline=THEME["warn"])
-
-
-def draw_ui_icon(canvas: tk.Canvas, icon: str, x: int, y: int, size: int) -> None:
-    if icon == "film":
-        draw_film_icon(canvas, x, y, size)
-    elif icon == "speaker":
-        draw_speaker_icon(canvas, x, y, size)
-    elif icon == "tv":
-        draw_tv_icon(canvas, x, y, size)
-    elif icon == "gear":
-        draw_gear_icon(canvas, x, y, size)
+    draw_liquid_glass_round_rect(canvas, x1, y1, x2, y2, radius, fill, outline, tint, width)
 
 
 def create_drawer_header(master: tk.Misc, title: str, icon: str, width: int) -> tk.Canvas:
@@ -405,38 +546,18 @@ def create_drawer_header(master: tk.Misc, title: str, icon: str, width: int) -> 
         master,
         width=width,
         height=54,
-        bg=THEME["panel"],
+        bg=THEME["glass_shadow_soft"],
         highlightthickness=0,
         bd=0,
     )
-    draw_scanlines(header, 8, 8, width - 8, 48, step=7, color="#111b31")
-    header.create_line(18, 9, width - 18, 9, fill="#11283c", width=1)
-    header.create_line(width // 2 - 48, 10, width // 2 + 48, 10, fill=THEME["line"], width=3, capstyle="round")
-    header.create_line(width // 2 - 18, 15, width // 2 + 18, 15, fill=THEME["line_2"], width=2, capstyle="round")
-    draw_ui_icon(header, icon, 18, 16, 24)
     header.create_text(
-        54,
+        24,
         28,
         anchor="w",
         text=title,
         fill=THEME["ink"],
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    header.create_text(
-        width - 72,
-        28,
-        text="LINK READY",
-        fill=THEME["muted"],
-        font=("Consolas", 8, "bold"),
-    )
-    draw_circuit_trace(
-        header,
-        [(width - 148, 28), (width - 122, 28), (width - 112, 38), (width - 90, 38)],
-        THEME["line_2"],
-        node_color=THEME["warn"],
-        width=1,
-    )
-    header.create_line(14, 52, width - 14, 52, fill="#24314d", width=1)
     return header
 
 
@@ -449,8 +570,8 @@ class CapsuleButton(tk.Canvas):
         icon: str = "",
         width: int = 96,
         height: int = 36,
-        fill: str = THEME["panel_2"],
-        active_fill: str = "#2a3244",
+        fill: str = THEME["glass_underlay"],
+        active_fill: str = THEME["panel_3"],
         fg: str = THEME["ink"],
         accent: str = THEME["line"],
         canvas_bg: str = THEME["panel"],
@@ -484,9 +605,8 @@ class CapsuleButton(tk.Canvas):
         self.delete("all")
         fill = self.active_fill if self.hover else self.fill
         if self.pressed:
-            fill = "#222a42"
-        glow = "#082f3a" if self.accent in (THEME["line"], THEME["teal"], THEME["blue"]) else "#3b1033"
-        draw_neon_round_rect(
+            fill = blend_color(THEME["glass_underlay"], self.accent, 0.08)
+        draw_glass_panel(
             self,
             4,
             4,
@@ -494,21 +614,11 @@ class CapsuleButton(tk.Canvas):
             self.height_value - 4,
             self.height_value // 2,
             fill=fill,
-            outline=self.accent,
-            glow=glow,
-            width=2,
+            outline=THEME["glass_edge"],
+            tint=self.accent,
+            width=1,
         )
-        draw_scanlines(self, 12, 10, self.width_value - 12, self.height_value - 10, step=6, color="#202a43")
-        self.create_line(20, 9, self.width_value - 22, 9, fill="#e8ffff", width=1)
-        self.create_line(18, self.height_value - 9, 42, self.height_value - 9, fill=THEME["warn"], width=2, capstyle="round")
-        self.create_oval(self.width_value - 18, 14, self.width_value - 12, 20, fill=self.accent, outline="")
         text_x = self.width_value // 2
-        if self.icon:
-            icon_size = min(22, self.height_value - 12)
-            icon_x = 12
-            icon_y = (self.height_value - icon_size) // 2
-            draw_ui_icon(self, self.icon, icon_x, icon_y, icon_size)
-            text_x = 12 + icon_size + (self.width_value - 12 - icon_size) // 2 + 2
         self.create_text(
             text_x,
             self.height_value // 2 + 1,
@@ -535,7 +645,7 @@ class CapsuleButton(tk.Canvas):
         self.pressed = False
         self._draw()
         if was_pressed:
-            self.command()
+            self.after(1, self.command)
 
 
 class StadiumButton(tk.Canvas):
@@ -546,11 +656,11 @@ class StadiumButton(tk.Canvas):
         command: Callable[[], None],
         width: int = 104,
         height: int = 40,
-        fill: str = "#101827",
-        active_fill: str = "#182235",
+        fill: str = THEME["glass_underlay"],
+        active_fill: str = THEME["panel_3"],
         outline: str = THEME["line"],
         fg: str = THEME["ink"],
-        canvas_bg: str = THEME["transparent"],
+        canvas_bg: str = THEME["glass_shadow_soft"],
     ) -> None:
         super().__init__(
             master,
@@ -580,16 +690,16 @@ class StadiumButton(tk.Canvas):
         self.delete("all")
         fill = self.active_fill if self.hover else self.fill
         if self.pressed:
-            fill = "#0a101c"
+            fill = blend_color(THEME["glass_underlay"], "#ffffff", 0.08)
         draw_capsule(
             self,
-            2,
-            2,
-            self.width_value - 2,
-            self.height_value - 2,
+            0,
+            0,
+            self.width_value,
+            self.height_value - 1,
             fill=fill,
-            outline=self.outline,
-            width=2,
+            outline=THEME["glass_edge"],
+            width=1,
         )
         self.create_text(
             self.width_value // 2,
@@ -617,16 +727,127 @@ class StadiumButton(tk.Canvas):
         self.pressed = False
         self._draw()
         if was_pressed:
-            self.command()
+            self.after(1, self.command)
 
 
-class CyberScrollBar(tk.Canvas):
+class GlassCanvasButton:
+    def __init__(
+        self,
+        canvas: tk.Canvas,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        text: str,
+        command: Callable[[], None],
+        accent: str,
+        fill: str,
+        active_fill: str,
+        backdrop: Optional[Image.Image] = None,
+    ) -> None:
+        self.canvas = canvas
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.text = text
+        self.command = command
+        self.accent = accent
+        self.fill = fill
+        self.active_fill = active_fill
+        self.backdrop = backdrop
+        self.image_ref: Optional[ImageTk.PhotoImage] = None
+        self.tag = f"glass_button_{id(self)}"
+        self.hover = False
+        self.pressed = False
+        self._draw()
+        self.canvas.tag_bind(self.tag, "<Enter>", self._on_enter)
+        self.canvas.tag_bind(self.tag, "<Leave>", self._on_leave)
+        self.canvas.tag_bind(self.tag, "<ButtonPress-1>", self._on_press)
+        self.canvas.tag_bind(self.tag, "<ButtonRelease-1>", self._on_release)
+
+    def _tag_new_items(self, before: set[int]) -> None:
+        after = set(self.canvas.find_all())
+        for item in after - before:
+            self.canvas.addtag_withtag(self.tag, item)
+
+    def _draw(self) -> None:
+        self.canvas.delete(self.tag)
+        before = set(self.canvas.find_all())
+        if self.backdrop is not None:
+            crop = self.backdrop.crop((self.x, self.y, self.x + self.width, self.y + self.height))
+            bitmap = make_liquid_glass_bitmap(
+                self.width,
+                self.height,
+                crop,
+                accent="#ffffff",
+                transparent_outside=True,
+                radius=self.height // 2,
+                blur_radius=20,
+                frost_alpha=72,
+                tint_alpha=0,
+                brightness=1.2,
+                compact_highlight=True,
+                clean_highlight=True,
+            )
+            self.image_ref = ImageTk.PhotoImage(bitmap)
+            self.canvas.create_image(self.x, self.y, anchor="nw", image=self.image_ref, tags=(self.tag,))
+        else:
+            fill = self.active_fill if self.hover else self.fill
+            if self.pressed:
+                fill = blend_color(self.active_fill, self.accent, 0.12)
+            draw_capsule(
+                self.canvas,
+                self.x,
+                self.y,
+                self.x + self.width,
+                self.y + self.height,
+                fill=fill,
+                outline=THEME["glass_edge"],
+                width=1,
+            )
+        self._tag_new_items(before)
+        self.canvas.create_text(
+            self.x + self.width // 2,
+            self.y + self.height // 2,
+            text=self.text,
+            fill=THEME["ink"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+            tags=(self.tag,),
+        )
+
+    def _on_enter(self, _event: tk.Event) -> str:
+        self.hover = True
+        return "break"
+
+    def _on_leave(self, _event: tk.Event) -> str:
+        self.hover = False
+        self.pressed = False
+        return "break"
+
+    def _on_press(self, _event: tk.Event) -> str:
+        self.pressed = True
+        return "break"
+
+    def _on_release(self, _event: tk.Event) -> str:
+        was_pressed = self.pressed
+        self.pressed = False
+        if was_pressed:
+            self.canvas.after(1, self.command)
+        return "break"
+
+    def set_backdrop(self, backdrop: Image.Image) -> None:
+        self.backdrop = backdrop
+        self._draw()
+
+
+class GlassScrollBar(tk.Canvas):
     def __init__(
         self,
         master: tk.Misc,
         command: Callable[[float], None],
         width: int = 18,
-        canvas_bg: str = "#050a14",
+        canvas_bg: str = THEME["field"],
     ) -> None:
         super().__init__(master, width=width, highlightthickness=0, bd=0, bg=canvas_bg)
         self.command = command
@@ -663,29 +884,29 @@ class CyberScrollBar(tk.Canvas):
         height = max(1, self.winfo_height())
         w = self.width_value
         track_top, track_bottom = self._track_bounds()
-        self.create_line(w // 2, track_top, w // 2, track_bottom, fill="#12213a", width=8, capstyle="round")
-        self.create_line(w // 2, track_top, w // 2, track_bottom, fill=THEME["line"], width=2, capstyle="round")
-        for y in range(track_top + 8, track_bottom, 18):
-            self.create_line(4, y, w - 4, y, fill=THEME["line_2"], width=1)
-        self.create_oval(5, 3, w - 5, 11, fill=THEME["warn"], outline="")
-        self.create_oval(5, height - 11, w - 5, height - 3, fill=THEME["line_2"], outline="")
+        self.create_line(
+            w // 2,
+            track_top,
+            w // 2,
+            track_bottom,
+            fill=THEME["glass_shadow_soft"],
+            width=6,
+            capstyle="round",
+        )
 
         top, bottom = self._thumb_bounds()
-        draw_neon_round_rect(
+        draw_glass_panel(
             self,
             2,
             top,
             w - 2,
             bottom,
             8,
-            fill="#061b25",
-            outline=THEME["teal"],
-            glow="#063a35",
-            width=2,
+            fill=THEME["panel_2"],
+            outline=THEME["glass_edge"],
+            tint=THEME["line"],
+            width=1,
         )
-        self.create_line(w // 2, top + 8, w // 2, bottom - 8, fill=THEME["warn"], width=2, capstyle="round")
-        for y in range(top + 10, bottom - 5, 9):
-            self.create_line(6, y, w - 6, y, fill="#163b4d", width=1)
 
     def _fraction_for_y(self, y: int) -> float:
         track_top, track_bottom = self._track_bounds()
@@ -713,19 +934,22 @@ class CyberScrollBar(tk.Canvas):
         self.dragging = False
 
 
-class CyberScrollText(tk.Frame):
+class GlassScrollText(tk.Frame):
     def __init__(self, master: tk.Misc, **text_kwargs) -> None:
-        bg = text_kwargs.pop("bg", "#050a14")
+        bg = text_kwargs.pop("bg", THEME["field_glass"])
         fg = text_kwargs.pop("fg", THEME["ink"])
         insertbackground = text_kwargs.pop("insertbackground", THEME["ink"])
-        selectbackground = text_kwargs.pop("selectbackground", THEME["line_2"])
-        highlightbackground = text_kwargs.pop("highlightbackground", THEME["line"])
+        selectbackground = text_kwargs.pop("selectbackground", THEME["selection"])
+        text_kwargs.pop("highlightbackground", None)
         text_kwargs.pop("relief", None)
         text_kwargs.pop("bd", None)
         text_kwargs.pop("highlightthickness", None)
-        super().__init__(master, bg=bg, highlightthickness=1, highlightbackground=highlightbackground, bd=0)
+        super().__init__(master, bg=THEME["field_outer"], highlightthickness=0, bd=0)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+        self._panel_canvas = tk.Canvas(self, bg=THEME["field_outer"], highlightthickness=0, bd=0)
+        self._panel_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.bind("<Configure>", self._draw_panel, add="+")
 
         self.text = tk.Text(
             self,
@@ -735,17 +959,49 @@ class CyberScrollText(tk.Frame):
             selectbackground=selectbackground,
             relief="flat",
             bd=0,
+            borderwidth=0,
+            highlightthickness=0,
+            highlightbackground=bg,
+            highlightcolor=bg,
             padx=10,
             pady=8,
             **text_kwargs,
         )
-        self.scrollbar = CyberScrollBar(self, command=self.text.yview_moveto, canvas_bg=bg)
+        self.scrollbar = GlassScrollBar(self, command=self.text.yview_moveto, canvas_bg=bg)
         self.text.configure(yscrollcommand=self.scrollbar.set)
-        self.text.grid(row=0, column=0, sticky="nsew")
-        self.scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 4), pady=4)
+        self.text.grid(row=0, column=0, sticky="nsew", padx=(18, 2), pady=14)
+        self.scrollbar.grid(row=0, column=1, sticky="ns", padx=(2, 14), pady=14)
         self.text.bind("<MouseWheel>", self._on_mousewheel, add="+")
         self.text.bind("<Button-4>", self._on_linux_scroll_up, add="+")
         self.text.bind("<Button-5>", self._on_linux_scroll_down, add="+")
+
+    def _draw_panel(self, _event: Optional[tk.Event] = None) -> None:
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        self._panel_canvas.delete("all")
+        draw_round_rect(
+            self._panel_canvas,
+            1,
+            1,
+            width - 2,
+            height - 2,
+            18,
+            fill=THEME["field_glass"],
+            outline=THEME["field_glass_edge"],
+            width=1,
+        )
+        draw_round_rect(
+            self._panel_canvas,
+            3,
+            3,
+            width - 4,
+            height - 4,
+            16,
+            fill="",
+            outline=blend_color(THEME["field_glass"], "#ffffff", 0.68),
+            width=1,
+        )
+        self.tk.call("lower", self._panel_canvas._w)
 
     def _on_mousewheel(self, event: tk.Event) -> str:
         self.text.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -798,6 +1054,25 @@ class DrawerToplevel(tk.Toplevel):
         self.withdraw()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
+        apply_transparent_window(self)
+        self._glass_backdrop_ref: Optional[ImageTk.PhotoImage] = None
+        self._glass_backdrop_bitmap: Optional[Image.Image] = None
+        self._glass_button_backdrop: Optional[Image.Image] = None
+        self._glass_backdrop_canvas = tk.Canvas(
+            self,
+            bg=THEME["transparent"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._glass_backdrop_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self._button_overlay_ref: Optional[ImageTk.PhotoImage] = None
+        self._button_overlay_buttons: list[GlassCanvasButton] = []
+        self._button_overlay_canvas = tk.Canvas(
+            self,
+            bg=THEME["transparent"],
+            highlightthickness=0,
+            bd=0,
+        )
         drawers = getattr(parent, "_drawer_windows", None)
         if drawers is None:
             drawers = []
@@ -811,9 +1086,11 @@ class DrawerToplevel(tk.Toplevel):
         self._target_width = self._compute_target_width()
         self._target_height = self._compute_target_height()
         self._folded = False
+        self._refresh_glass_backdrop(self._target_height, capture=False)
         self.deiconify()
         self.lift()
         self._animate_open(58)
+        self.after(80, lambda: self._refresh_glass_backdrop(self._target_height, capture=True))
 
     def close_drawer(self, after_close: Optional[Callable[[], None]] = None) -> None:
         if not self.winfo_exists():
@@ -874,6 +1151,10 @@ class DrawerToplevel(tk.Toplevel):
         return min(self.drawer_height, max(260, int(screen_height * 0.54)))
 
     def _drawer_geometry(self, height: int) -> str:
+        x, y, width, height = self._drawer_bbox(height)
+        return f"{width}x{height}+{x}+{y}"
+
+    def _drawer_bbox(self, height: int) -> tuple[int, int, int, int]:
         self.anchor_window.update_idletasks()
         screen_width = self.anchor_window.winfo_screenwidth()
         anchor_x = self.anchor_window.winfo_rootx()
@@ -883,7 +1164,112 @@ class DrawerToplevel(tk.Toplevel):
         x = anchor_x + anchor_w // 2 - width // 2
         x = min(max(12, x), max(12, screen_width - width - 12))
         y = max(12, anchor_y - height - 8)
-        return f"{width}x{height}+{x}+{y}"
+        return x, y, width, height
+
+    def _refresh_glass_backdrop(self, height: int, capture: bool = True) -> None:
+        width = self._target_width
+        height = max(58, min(height, self._target_height))
+        x, y, width, height = self._drawer_bbox(height)
+        was_viewable = bool(self.winfo_viewable())
+        if was_viewable:
+            self.withdraw()
+            self.update_idletasks()
+            self.update()
+        screen_image = None
+        if capture:
+            try:
+                screen_image = grab_screen_region(x, y, width, height)
+            finally:
+                if was_viewable:
+                    self.deiconify()
+                    self.lift()
+        elif was_viewable:
+            self.deiconify()
+            self.lift()
+        if screen_image is None:
+            self._glass_button_backdrop = create_fallback_backdrop(width, height)
+        else:
+            self._glass_button_backdrop = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        bitmap = make_liquid_glass_bitmap(
+            width,
+            height,
+            screen_image,
+            accent="#ffffff",
+            radius=28,
+            blur_radius=22,
+            frost_alpha=48,
+            tint_alpha=0,
+            brightness=1.12,
+            clean_highlight=True,
+        )
+        self._glass_backdrop_bitmap = bitmap.convert("RGB")
+        self._glass_backdrop_ref = ImageTk.PhotoImage(bitmap)
+        self._glass_backdrop_canvas.configure(width=width, height=height)
+        self._glass_backdrop_canvas.delete("all")
+        self._glass_backdrop_canvas.create_image(
+            0,
+            0,
+            anchor="nw",
+            image=self._glass_backdrop_ref,
+        )
+        self.update_idletasks()
+        self._draw_background_overlays(self._glass_backdrop_canvas, width, height)
+        self.tk.call("lower", self._glass_backdrop_canvas._w)
+        self._refresh_button_overlay(width, height)
+
+    def _draw_background_overlays(self, _canvas: tk.Canvas, _width: int, _height: int) -> None:
+        return
+
+    def _drawer_button_specs(self, _width: int, _height: int) -> list[tuple[int, int, int, int, str, Callable[[], None]]]:
+        return []
+
+    def _refresh_button_overlay(self, width: int, height: int) -> None:
+        specs = self._drawer_button_specs(width, height)
+        if not specs:
+            self._button_overlay_canvas.place_forget()
+            self._button_overlay_buttons = []
+            self._button_overlay_ref = None
+            return
+
+        left = min(spec[0] for spec in specs)
+        top = min(spec[1] for spec in specs)
+        right = max(spec[0] + spec[2] for spec in specs)
+        bottom = max(spec[1] + spec[3] for spec in specs)
+        overlay_width = right - left
+        overlay_height = bottom - top
+        self._button_overlay_canvas.configure(width=overlay_width, height=overlay_height)
+        self._button_overlay_canvas.place(x=left, y=top, width=overlay_width, height=overlay_height)
+        self._button_overlay_canvas.delete("all")
+
+        if self._glass_backdrop_bitmap is not None:
+            background = self._glass_backdrop_bitmap.crop((left, top, right, bottom))
+        else:
+            background = create_fallback_backdrop(overlay_width, overlay_height)
+        self._button_overlay_ref = ImageTk.PhotoImage(background)
+        self._button_overlay_canvas.create_image(0, 0, anchor="nw", image=self._button_overlay_ref)
+
+        if self._glass_button_backdrop is not None:
+            button_backdrop = self._glass_button_backdrop.crop((left, top, right, bottom))
+        else:
+            button_backdrop = create_fallback_backdrop(overlay_width, overlay_height)
+
+        self._button_overlay_buttons = [
+            GlassCanvasButton(
+                self._button_overlay_canvas,
+                x - left,
+                y - top,
+                button_width,
+                button_height,
+                text=text,
+                command=command,
+                accent="#ffffff",
+                fill=THEME["glass_underlay"],
+                active_fill=THEME["panel_3"],
+                backdrop=button_backdrop,
+            )
+            for x, y, button_width, button_height, text, command in specs
+        ]
+        self.tk.call("raise", self._button_overlay_canvas._w)
 
     def _animate_open(self, height: int) -> None:
         if not self.winfo_exists():
@@ -897,7 +1283,7 @@ class DrawerToplevel(tk.Toplevel):
                 focus_widget.focus_set()
             return
         next_height = min(self._target_height, height + max(22, (self._target_height - height) // 4))
-        self.after(12, lambda: self._animate_open(next_height))
+        self.after(8, lambda: self._animate_open(next_height))
 
     def _animate_close(
         self,
@@ -915,7 +1301,7 @@ class DrawerToplevel(tk.Toplevel):
             return
         self.geometry(self._drawer_geometry(height))
         next_height = max(58, height - max(24, height // 4))
-        self.after(10, lambda: self._animate_close(next_height, after_close))
+        self.after(8, lambda: self._animate_close(next_height, after_close))
 
 
 @dataclass(frozen=True)
@@ -1051,7 +1437,7 @@ class SelectionOverlay:
 
     def open(self) -> None:
         self.root.withdraw()
-        self.root.after(180, self._show_overlay)
+        self.root.after(50, self._show_overlay)
 
     def _show_overlay(self) -> None:
         win = tk.Toplevel(self.root)
@@ -1092,7 +1478,7 @@ class SelectionOverlay:
             self.start_y,
             event.x,
             event.y,
-            outline="#ff4d4f",
+            outline=THEME["line"],
             width=3,
         )
 
@@ -1120,7 +1506,7 @@ class SelectionOverlay:
             self.on_cancel()
             return
 
-        self.root.after(80, lambda: self._grab_region(left, top, right, bottom))
+        self.root.after(20, lambda: self._grab_region(left, top, right, bottom))
 
     def _grab_region(self, left: int, top: int, right: int, bottom: int) -> None:
         try:
@@ -1153,97 +1539,67 @@ class PromptDialog(DrawerToplevel):
         self.resizable(False, False)
         self.on_submit = on_submit
         self.preview_ref: Optional[ImageTk.PhotoImage] = None
+        self._question_label_y = 78
 
-        self.configure(bg=THEME["panel_deep"])
+        self.configure(bg=THEME["transparent"])
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
-
-        header = create_drawer_header(self, title, "tv", 620)
-        header.grid(row=0, column=0, sticky="ew")
+        self.rowconfigure(0, minsize=54)
+        self.rowconfigure(2, minsize=28)
+        self.rowconfigure(3, weight=1)
+        self.rowconfigure(4, minsize=56)
+        self._drawer_title = title
 
         if image is not None:
             preview = self._make_preview(image)
-            preview_label = tk.Label(self, image=preview, bg=THEME["panel_deep"])
-            preview_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 8))
+            preview_panel = self._make_preview_panel(preview)
+            preview_panel.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 8))
             self.preview_ref = preview
+            self._question_label_y = 54 + 10 + preview.height() + 24 + 8 + 18
         elif body_text is not None:
             snippet = body_text.strip()
             if len(snippet) > 900:
                 snippet = snippet[:900] + "\n..."
-            text_preview = CyberScrollText(
+            text_preview = GlassScrollText(
                 self,
                 height=8,
                 wrap="word",
                 font=("Microsoft YaHei UI", 10),
-                bg="#050a14",
+                bg=THEME["field"],
                 fg=THEME["ink"],
                 insertbackground=THEME["ink"],
-                selectbackground=THEME["line_2"],
+                selectbackground=THEME["selection"],
                 highlightthickness=1,
-                highlightbackground=THEME["line"],
+                highlightbackground=THEME["glass_edge"],
                 relief="solid",
                 bd=1,
             )
             text_preview.insert("1.0", snippet)
             text_preview.configure(state="disabled")
+            text_preview.update_idletasks()
+            preview_height = max(160, int(text_preview.winfo_reqheight() * 0.9))
+            tk.Frame.configure(text_preview, height=preview_height)
+            text_preview.grid_propagate(False)
             text_preview.grid(row=1, column=0, sticky="nsew", padx=14, pady=(10, 8))
+            self._question_label_y = 54 + 10 + preview_height + 8 + 18
 
-        prompt_frame = tk.Frame(self, bg=THEME["panel_deep"])
-        prompt_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=8)
-        prompt_frame.columnconfigure(0, weight=1)
-        prompt_frame.rowconfigure(1, weight=1)
-
-        tk.Label(
-            prompt_frame,
-            text="问题 / 指令",
-            bg=THEME["panel_deep"],
-            fg=THEME["line"],
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
-
-        self.text = CyberScrollText(
-            prompt_frame,
+        self.text = GlassScrollText(
+            self,
             height=5,
             width=64,
             wrap="word",
             font=("Microsoft YaHei UI", 10),
-            bg="#050a14",
+            bg=THEME["field"],
             fg=THEME["ink"],
             insertbackground=THEME["ink"],
-            selectbackground=THEME["line_2"],
+            selectbackground=THEME["selection"],
             highlightthickness=1,
-            highlightbackground=THEME["line"],
+            highlightbackground=THEME["glass_edge"],
             relief="solid",
             bd=1,
         )
         self.text.insert("1.0", default_question)
-        self.text.grid(row=1, column=0, sticky="nsew")
+        self.text.grid(row=3, column=0, sticky="nsew", padx=14, pady=(0, 8))
         self.drawer_focus_widget = self.text
-
-        buttons = tk.Frame(self, bg=THEME["panel_deep"])
-        buttons.grid(row=3, column=0, sticky="e", padx=14, pady=(8, 14))
-        StadiumButton(
-            buttons,
-            text="取消",
-            command=self.close_drawer,
-            width=88,
-            height=36,
-            fill="#2d1e28",
-            active_fill="#442737",
-            outline=THEME["red"],
-            canvas_bg=THEME["panel_deep"],
-        ).pack(side="right", padx=(8, 0))
-        StadiumButton(
-            buttons,
-            text="发送",
-            command=self._submit,
-            width=88,
-            height=36,
-            fill="#0d2a2a",
-            active_fill="#123f3e",
-            outline=THEME["teal"],
-            canvas_bg=THEME["panel_deep"],
-        ).pack(side="right")
 
         self.bind("<Control-Return>", lambda _event: self._submit())
         self.protocol("WM_DELETE_WINDOW", self.close_drawer)
@@ -1251,11 +1607,73 @@ class PromptDialog(DrawerToplevel):
         self.focus_force()
         self.text.focus_set()
 
+    def _draw_background_overlays(self, canvas: tk.Canvas, width: int, height: int) -> None:
+        canvas.create_text(
+            24,
+            28,
+            anchor="w",
+            text=self._drawer_title,
+            fill=THEME["ink"],
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        question_y = self._question_label_y
+        canvas.create_text(
+            16,
+            question_y,
+            anchor="w",
+            text="问题 / 指令",
+            fill=THEME["ink"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+
+    def _drawer_button_specs(self, width: int, height: int) -> list[tuple[int, int, int, int, str, Callable[[], None]]]:
+        button_width = 92
+        button_height = 40
+        button_gap = 10
+        button_y = height - 54
+        cancel_x = width - 14 - button_width
+        send_x = cancel_x - button_gap - button_width
+        return [
+            (send_x, button_y, button_width, button_height, "发送", self._submit),
+            (cancel_x, button_y, button_width, button_height, "取消", self.close_drawer),
+        ]
+
     @staticmethod
     def _make_preview(image: Image.Image) -> ImageTk.PhotoImage:
         preview = image.copy()
         preview.thumbnail((560, 260))
         return ImageTk.PhotoImage(preview)
+
+    def _make_preview_panel(self, preview: ImageTk.PhotoImage) -> tk.Canvas:
+        panel_height = preview.height() + 24
+        panel = tk.Canvas(
+            self,
+            height=panel_height,
+            bg=THEME["field_outer"],
+            highlightthickness=0,
+            bd=0,
+        )
+        panel.preview_ref = preview  # type: ignore[attr-defined]
+
+        def draw_preview_panel(_event: Optional[tk.Event] = None) -> None:
+            width = max(1, panel.winfo_width())
+            panel.delete("all")
+            draw_round_rect(
+                panel,
+                0,
+                0,
+                width,
+                panel_height,
+                18,
+                fill=THEME["field_glass"],
+                outline=THEME["field_glass_edge"],
+                width=1,
+            )
+            panel.create_image(width // 2, panel_height // 2, image=preview)
+
+        panel.bind("<Configure>", draw_preview_panel, add="+")
+        panel.after_idle(draw_preview_panel)
+        return panel
 
     def _submit(self) -> None:
         question = self.text.get("1.0", "end").strip()
@@ -1267,24 +1685,24 @@ class ResultWindow(DrawerToplevel):
         super().__init__(parent, drawer_width=720, drawer_height=560)
         self.title("LLM 回答")
         self.attributes("-topmost", True)
-        self.configure(bg=THEME["panel_deep"])
+        self.configure(bg=THEME["transparent"])
         self.geometry("720x58+0+0")
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, minsize=54)
         self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, minsize=56)
+        self._drawer_title = "LLM 回答"
 
-        header = create_drawer_header(self, "LLM 回答", "speaker", 720)
-        header.grid(row=0, column=0, sticky="ew")
-
-        self.text = CyberScrollText(
+        self.text = GlassScrollText(
             self,
             wrap="word",
             font=("Microsoft YaHei UI", 10),
-            bg="#050a14",
+            bg=THEME["field"],
             fg=THEME["ink"],
             insertbackground=THEME["ink"],
-            selectbackground=THEME["line_2"],
+            selectbackground=THEME["selection"],
             highlightthickness=1,
-            highlightbackground=THEME["line"],
+            highlightbackground=THEME["glass_edge"],
             relief="solid",
             bd=1,
         )
@@ -1292,30 +1710,27 @@ class ResultWindow(DrawerToplevel):
         self.text.configure(state="disabled")
         self.text.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
 
-        buttons = tk.Frame(self, bg=THEME["panel_deep"])
-        buttons.grid(row=2, column=0, sticky="e", padx=14, pady=(0, 14))
-        StadiumButton(
-            buttons,
-            text="复制",
-            command=self.copy_answer,
-            width=88,
-            height=36,
-            fill="#302417",
-            active_fill="#49351d",
-            outline=THEME["warn"],
-            canvas_bg=THEME["panel_deep"],
-        ).pack(side="right", padx=(8, 0))
-        StadiumButton(
-            buttons,
-            text="关闭",
-            command=self.close_drawer,
-            width=88,
-            height=36,
-            fill="#2d1e28",
-            active_fill="#442737",
-            outline=THEME["red"],
-            canvas_bg=THEME["panel_deep"],
-        ).pack(side="right")
+    def _draw_background_overlays(self, canvas: tk.Canvas, width: int, height: int) -> None:
+        canvas.create_text(
+            24,
+            28,
+            anchor="w",
+            text=self._drawer_title,
+            fill=THEME["ink"],
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+
+    def _drawer_button_specs(self, width: int, height: int) -> list[tuple[int, int, int, int, str, Callable[[], None]]]:
+        button_width = 92
+        button_height = 40
+        button_gap = 10
+        button_y = height - 54
+        copy_x = width - 14 - button_width
+        close_x = copy_x - button_gap - button_width
+        return [
+            (close_x, button_y, button_width, button_height, "关闭", self.close_drawer),
+            (copy_x, button_y, button_width, button_height, "复制", self.copy_answer),
+        ]
 
     def set_text(self, value: str) -> None:
         self.text.configure(state="normal")
@@ -1335,11 +1750,11 @@ class RandomAskApp:
         self.root.title(APP_TITLE)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.98)
+        self.root.attributes("-alpha", 0.97)
         apply_transparent_window(self.root)
         screen_height = self.root.winfo_screenheight()
         initial_y = max(80, screen_height - 168)
-        self.root.geometry(f"356x54+120+{initial_y}")
+        self.root.geometry(f"372x62+120+{initial_y}")
 
         self.config = AppConfig.from_env()
         self.llm: Optional[LLMClient] = None
@@ -1353,7 +1768,11 @@ class RandomAskApp:
         self.clipboard_seq_before: Optional[int] = None
         self.drag_start_x = 0
         self.drag_start_y = 0
-        self.gear_angle = 0.0
+        self._bubble_moved = False
+        self._drag_screen_snapshot: Optional[Image.Image] = None
+        self._drag_screen_origin = (0, 0)
+        self._last_drag_glass_update = 0.0
+        self._drag_glass_update_pending = False
         self.tray_icon = None
 
         self._build_bubble()
@@ -1382,17 +1801,11 @@ class RandomAskApp:
         size = 64
         image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.ellipse((5, 5, 59, 59), fill=(7, 9, 20, 255), outline=(0, 245, 255, 255), width=3)
-        cx = cy = size // 2
-        teeth = 10
-        points: list[tuple[float, float]] = []
-        for i in range(teeth * 2):
-            angle = -math.pi / 2 + math.tau * i / (teeth * 2)
-            radius = 22 if i % 2 == 0 else 17
-            points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
-        draw.polygon(points, fill=(237, 247, 255, 255), outline=(7, 9, 20, 255))
-        draw.ellipse((23, 23, 41, 41), fill=(7, 9, 20, 255), outline=(0, 245, 212, 255), width=3)
-        draw.ellipse((29, 29, 35, 35), fill=(255, 242, 61, 255))
+        draw.ellipse((8, 10, 58, 60), fill=(177, 195, 218, 96))
+        draw.ellipse((5, 5, 57, 57), fill=(249, 252, 255, 238), outline=(255, 255, 255, 255), width=2)
+        draw.arc((10, 9, 54, 53), start=205, end=318, fill=(95, 151, 240, 210), width=3)
+        draw.arc((12, 10, 50, 47), start=28, end=138, fill=(255, 255, 255, 245), width=3)
+        draw.text((27, 20), "?", fill=(23, 32, 51, 255))
         return image
 
     def quit_app(self) -> None:
@@ -1404,9 +1817,159 @@ class RandomAskApp:
             self.tray_icon = None
         self.root.destroy()
 
+    def _capture_bubble_backdrop(self, width: int, height: int, hide_window: bool = False) -> Optional[Image.Image]:
+        self.root.update_idletasks()
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        was_viewable = bool(self.root.winfo_viewable())
+        if hide_window and was_viewable:
+            self.root.withdraw()
+            self.root.update_idletasks()
+            self.root.update()
+        try:
+            try:
+                return ImageGrab.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+            except TypeError:
+                return ImageGrab.grab(bbox=(x, y, x + width, y + height))
+            except Exception:
+                return None
+        finally:
+            if hide_window and was_viewable:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.update_idletasks()
+
+    def _refresh_bubble_glass(self, hide_window: bool = False) -> None:
+        if not hasattr(self, "bubble_canvas"):
+            return
+        width = self.bubble_width
+        height = self.bubble_height
+        screen_image = self._capture_bubble_backdrop(width, height, hide_window=hide_window)
+        self._set_bubble_glass_from_image(screen_image)
+
+    def _set_bubble_glass_from_image(self, screen_image: Optional[Image.Image]) -> None:
+        if not hasattr(self, "bubble_canvas"):
+            return
+        width = self.bubble_width
+        height = self.bubble_height
+        if screen_image is None:
+            self.bubble_screen_image = create_fallback_backdrop(width, height)
+        else:
+            self.bubble_screen_image = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        bitmap = make_liquid_glass_bitmap(
+            width,
+            height,
+            self.bubble_screen_image,
+            accent="#ffffff",
+            tint_alpha=0,
+            clean_highlight=True,
+        )
+        self.bubble_glass_ref = ImageTk.PhotoImage(bitmap)
+        self.bubble_canvas.delete("bubble_glass")
+        self.bubble_canvas.create_image(0, 0, anchor="nw", image=self.bubble_glass_ref, tags=("bubble_glass",))
+        self.bubble_canvas.tag_lower("bubble_glass")
+        for button in getattr(self, "main_buttons", []):
+            button.set_backdrop(self.bubble_screen_image)
+        if hasattr(self, "drag_handle_ref"):
+            self._draw_drag_handle()
+
+    def _apply_sampled_glass_canvas(
+        self,
+        window: tk.Toplevel,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+        accent: str,
+        radius: int,
+    ) -> None:
+        window.update_idletasks()
+        x = window.winfo_rootx()
+        y = window.winfo_rooty()
+        was_viewable = bool(window.winfo_viewable())
+        if was_viewable:
+            window.withdraw()
+            window.update_idletasks()
+            window.update()
+        try:
+            screen_image = grab_screen_region(x, y, width, height)
+        finally:
+            if was_viewable:
+                window.deiconify()
+                window.lift()
+        if screen_image is None:
+            canvas.sampled_glass_screen_image = create_fallback_backdrop(width, height)  # type: ignore[attr-defined]
+        else:
+            canvas.sampled_glass_screen_image = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)  # type: ignore[attr-defined]
+        bitmap = make_liquid_glass_bitmap(
+            width,
+            height,
+            screen_image,
+            accent="#ffffff",
+            radius=radius,
+            blur_radius=22,
+            frost_alpha=48,
+            tint_alpha=0,
+            brightness=1.12,
+            clean_highlight=True,
+        )
+        canvas.glass_backdrop_ref = ImageTk.PhotoImage(bitmap)  # type: ignore[attr-defined]
+        canvas.delete("sampled_glass")
+        canvas.create_image(0, 0, anchor="nw", image=canvas.glass_backdrop_ref, tags=("sampled_glass",))
+        canvas.tag_lower("sampled_glass")
+        for button in getattr(canvas, "inline_buttons", []):
+            button.set_backdrop(canvas.sampled_glass_screen_image)  # type: ignore[attr-defined]
+
+    def _capture_drag_screen_snapshot(self) -> None:
+        left, top, width, height = get_virtual_screen_bounds(self.root)
+        try:
+            try:
+                snapshot = ImageGrab.grab(bbox=(left, top, left + width, top + height), all_screens=True)
+            except TypeError:
+                snapshot = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+        except Exception:
+            snapshot = None
+        if snapshot is None:
+            self._drag_screen_snapshot = None
+            self._drag_screen_origin = (0, 0)
+            return
+        self._drag_screen_snapshot = snapshot.convert("RGB")
+        self._drag_screen_origin = (left, top)
+
+    def _refresh_bubble_glass_from_drag_snapshot(self, force: bool = False) -> None:
+        snapshot = self._drag_screen_snapshot
+        if snapshot is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_drag_glass_update < 0.033:
+            if not self._drag_glass_update_pending:
+                self._drag_glass_update_pending = True
+                self.root.after(16, self._run_pending_drag_glass_update)
+            return
+        self._drag_glass_update_pending = False
+        self._last_drag_glass_update = now
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        crop = crop_from_screen_snapshot(
+            snapshot,
+            self._drag_screen_origin,
+            x,
+            y,
+            self.bubble_width,
+            self.bubble_height,
+        )
+        self._set_bubble_glass_from_image(crop)
+
+    def _run_pending_drag_glass_update(self) -> None:
+        if not self._bubble_moved:
+            self._drag_glass_update_pending = False
+            return
+        self._refresh_bubble_glass_from_drag_snapshot(force=True)
+
     def _build_bubble(self) -> None:
-        width = 356
-        height = 54
+        width = 372
+        height = 62
+        self.bubble_width = width
+        self.bubble_height = height
         canvas = tk.Canvas(
             self.root,
             width=width,
@@ -1421,132 +1984,123 @@ class RandomAskApp:
         for widget in (canvas, self.root):
             widget.bind("<ButtonPress-1>", self._start_move)
             widget.bind("<B1-Motion>", self._on_move)
+            widget.bind("<ButtonRelease-1>", self._finish_move, add="+")
 
-        draw_capsule(
-            canvas,
-            1,
-            1,
-            width - 1,
-            height - 1,
-            fill=THEME["panel"],
-            outline=THEME["line"],
-            width=2,
-        )
+        self._refresh_bubble_glass()
 
-        self._draw_drag_gear()
-        self._animate_drag_gear()
+        self._draw_drag_handle()
 
-        ask_btn = StadiumButton(
-            canvas,
-            text="框选问",
-            command=self.capture_region,
-            width=96,
-            height=40,
-            fill="#101827",
-            active_fill="#182235",
-            outline=THEME["blue"],
-        )
-        text_btn = StadiumButton(
-            canvas,
-            text="拖文本",
-            command=self.select_text_then_ask,
-            width=96,
-            height=40,
-            fill="#0d1f21",
-            active_fill="#123033",
-            outline=THEME["teal"],
-        )
-        clip_btn = StadiumButton(
-            canvas,
-            text="剪贴板",
-            command=self.ask_clipboard,
-            width=96,
-            height=40,
-            fill="#302417",
-            active_fill="#49351d",
-            outline=THEME["warn"],
-        )
-        canvas.create_window(94, height // 2, window=ask_btn)
-        canvas.create_window(196, height // 2, window=text_btn)
-        canvas.create_window(298, height // 2, window=clip_btn)
+        self.main_buttons = [
+            GlassCanvasButton(
+                canvas,
+                64,
+                11,
+                92,
+                40,
+                text="框选问",
+                command=self.capture_region,
+                accent="#ffffff",
+                fill=THEME["panel_2"],
+                active_fill=THEME["glass_underlay"],
+                backdrop=self.bubble_screen_image,
+            ),
+            GlassCanvasButton(
+                canvas,
+                166,
+                11,
+                92,
+                40,
+                text="拖文本",
+                command=self.select_text_then_ask,
+                accent="#ffffff",
+                fill=THEME["panel_2"],
+                active_fill=THEME["glass_underlay"],
+                backdrop=self.bubble_screen_image,
+            ),
+            GlassCanvasButton(
+                canvas,
+                268,
+                11,
+                92,
+                40,
+                text="剪贴板",
+                command=self.ask_clipboard,
+                accent="#ffffff",
+                fill=THEME["panel_2"],
+                active_fill=THEME["glass_underlay"],
+                backdrop=self.bubble_screen_image,
+            ),
+        ]
 
-    def _draw_drag_gear(self) -> None:
+    def _draw_drag_handle(self) -> None:
         canvas = self.bubble_canvas
-        canvas.delete("drag_gear")
-        cx = 26
-        cy = 27
-        tooth_outer = 16
-        tooth_inner = 13
-        hub_outer = 8
-        bore = 3
-        canvas.create_oval(
-            cx - 20,
-            cy - 20,
-            cx + 20,
-            cy + 20,
-            fill="#0a111d",
-            outline=THEME["line"],
-            width=2,
-            tags=("drag_gear",),
+        canvas.delete("drag_handle")
+        cx = 30
+        cy = 31
+        size = 44
+        left = cx - size // 2
+        top = cy - size // 2
+        backdrop = getattr(self, "bubble_screen_image", None)
+        if backdrop is not None:
+            crop = backdrop.crop((left, top, left + size, top + size))
+        else:
+            crop = create_fallback_backdrop(size, size)
+        bitmap = make_liquid_glass_bitmap(
+            size,
+            size,
+            crop,
+            accent="#ffffff",
+            transparent_outside=True,
+            radius=size // 2 - 3,
+            blur_radius=18,
+            frost_alpha=34,
+            tint_alpha=0,
+            brightness=1.12,
+            compact_highlight=True,
+            clean_highlight=True,
+            shell_rect_override=(3, 3, size - 3, size - 3),
         )
-        points: list[float] = []
-        teeth = 10
-        for i in range(teeth * 2):
-            angle = self.gear_angle + math.tau * i / (teeth * 2)
-            radius = tooth_outer if i % 2 == 0 else tooth_inner
-            points.extend([cx + math.cos(angle) * radius, cy + math.sin(angle) * radius])
-        canvas.create_polygon(
-            points,
-            fill=THEME["ink"],
-            outline="#0a111d",
-            width=1,
-            smooth=False,
-            tags=("drag_gear",),
-        )
-        canvas.create_oval(
-            cx - hub_outer,
-            cy - hub_outer,
-            cx + hub_outer,
-            cy + hub_outer,
-            fill="#111827",
-            outline=THEME["teal"],
-            width=2,
-            tags=("drag_gear",),
-        )
-        canvas.create_oval(
-            cx - bore,
-            cy - bore,
-            cx + bore,
-            cy + bore,
-            fill=THEME["warn"],
-            outline="#0a111d",
-            tags=("drag_gear",),
-        )
-        canvas.tag_bind("drag_gear", "<ButtonPress-1>", self._start_move)
-        canvas.tag_bind("drag_gear", "<B1-Motion>", self._on_move)
-
-    def _animate_drag_gear(self) -> None:
-        if not hasattr(self, "bubble_canvas") or not self.root.winfo_exists():
-            return
-        self.gear_angle = (self.gear_angle + 0.08) % math.tau
-        self._draw_drag_gear()
-        self.root.after(80, self._animate_drag_gear)
+        self.drag_handle_ref = ImageTk.PhotoImage(bitmap)
+        canvas.create_image(left, top, anchor="nw", image=self.drag_handle_ref, tags=("drag_handle",))
+        canvas.tag_bind("drag_handle", "<ButtonPress-1>", self._start_move)
+        canvas.tag_bind("drag_handle", "<B1-Motion>", self._on_move)
 
     def _start_move(self, event: tk.Event) -> None:
         self.drag_start_x = event.x
         self.drag_start_y = event.y
+        self._bubble_moved = False
+        self._drag_glass_update_pending = False
+        self._last_drag_glass_update = 0.0
+        self._capture_drag_screen_snapshot()
 
     def _on_move(self, event: tk.Event) -> None:
         x = self.root.winfo_pointerx() - self.drag_start_x
         y = self.root.winfo_pointery() - self.drag_start_y
         self.root.geometry(f"+{x}+{y}")
+        self._bubble_moved = True
+        self._refresh_bubble_glass_from_drag_snapshot()
         self._reposition_open_drawers()
+
+    def _finish_move(self, _event: tk.Event) -> None:
+        if not self._bubble_moved:
+            return
+        self._refresh_bubble_glass_from_drag_snapshot(force=True)
+        self._bubble_moved = False
+        self._drag_screen_snapshot = None
+        self._drag_glass_update_pending = False
+        self.root.after(160, self._refresh_open_drawer_glass)
 
     def _reposition_open_drawers(self) -> None:
         drawers = list(getattr(self.root, "_drawer_windows", []))
         for drawer in drawers:
             if isinstance(drawer, DrawerToplevel):
                 drawer.reposition_to_anchor()
+
+    def _refresh_open_drawer_glass(self) -> None:
+        drawers = list(getattr(self.root, "_drawer_windows", []))
+        for drawer in drawers:
+            if isinstance(drawer, DrawerToplevel) and drawer.winfo_exists() and drawer.winfo_viewable():
+                drawer._refresh_glass_backdrop(drawer.winfo_height(), capture=True)
 
     def capture_region(self) -> None:
         if self._toggle_existing_drawer(self.image_prompt_dialog):
@@ -1569,7 +2123,7 @@ class RandomAskApp:
         self.clipboard_seq_before = None
         self.root.withdraw()
         self._show_text_drag_tip()
-        self.root.after(80, self._wait_for_button_release_before_text_drag)
+        self.root.after(20, self._wait_for_button_release_before_text_drag)
 
     def ask_clipboard(self) -> None:
         if self._toggle_existing_drawer(self.clipboard_prompt_dialog):
@@ -1631,17 +2185,6 @@ class RandomAskApp:
             bd=0,
         )
         canvas.pack(fill="both", expand=True)
-        draw_round_rect(
-            canvas,
-            2,
-            2,
-            width - 2,
-            height - 2,
-            24,
-            fill=THEME["panel"],
-            outline=THEME["teal"],
-            width=2,
-        )
         canvas.create_text(
             24,
             16,
@@ -1659,51 +2202,54 @@ class RandomAskApp:
             width=230,
             font=("Microsoft YaHei UI", 9),
         )
-        cancel_btn = StadiumButton(
-            canvas,
-            text="取消",
-            command=self._cancel_text_drag,
-            width=78,
-            height=34,
-            fill="#2d1e28",
-            active_fill="#442737",
-            outline=THEME["red"],
-            canvas_bg=THEME["panel"],
-        )
-        canvas.create_window(width - 54, height - 34, window=cancel_btn)
+        canvas.inline_buttons = [  # type: ignore[attr-defined]
+            GlassCanvasButton(
+                canvas,
+                width - 106,
+                height - 55,
+                92,
+                40,
+                text="取消",
+                command=self._cancel_text_drag,
+                accent="#ffffff",
+                fill=THEME["glass_underlay"],
+                active_fill=THEME["panel_3"],
+            )
+        ]
         self.text_drag_tip = tip
         self._center_near_bubble(tip)
+        self._apply_sampled_glass_canvas(tip, canvas, width, height, THEME["teal"], 26)
 
     def _wait_for_button_release_before_text_drag(self) -> None:
         if not self.text_drag_active:
             return
         if is_left_mouse_down():
-            self.root.after(40, self._wait_for_button_release_before_text_drag)
+            self.root.after(20, self._wait_for_button_release_before_text_drag)
             return
-        self.root.after(40, self._wait_for_text_drag_start)
+        self.root.after(20, self._wait_for_text_drag_start)
 
     def _wait_for_text_drag_start(self) -> None:
         if not self.text_drag_active:
             return
         if is_left_mouse_down():
             self.clipboard_seq_before = get_clipboard_sequence_number()
-            self.root.after(80, self._wait_for_text_drag_end)
+            self.root.after(35, self._wait_for_text_drag_end)
             return
-        self.root.after(50, self._wait_for_text_drag_start)
+        self.root.after(35, self._wait_for_text_drag_start)
 
     def _wait_for_text_drag_end(self) -> None:
         if not self.text_drag_active:
             return
         if is_left_mouse_down():
-            self.root.after(60, self._wait_for_text_drag_end)
+            self.root.after(35, self._wait_for_text_drag_end)
             return
-        self.root.after(160, self._copy_selected_text_after_drag)
+        self.root.after(70, self._copy_selected_text_after_drag)
 
     def _copy_selected_text_after_drag(self) -> None:
         if not self.text_drag_active:
             return
         send_ctrl_c()
-        self.root.after(180, lambda: self._read_clipboard_after_copy(12))
+        self.root.after(70, lambda: self._read_clipboard_after_copy(12))
 
     def _read_clipboard_after_copy(self, retries: int) -> None:
         if not self.text_drag_active:
@@ -1711,7 +2257,7 @@ class RandomAskApp:
 
         seq_after = get_clipboard_sequence_number()
         if self.clipboard_seq_before == seq_after and retries > 0:
-            self.root.after(100, lambda: self._read_clipboard_after_copy(retries - 1))
+            self.root.after(60, lambda: self._read_clipboard_after_copy(retries - 1))
             return
 
         if self.clipboard_seq_before == seq_after:
@@ -1759,54 +2305,47 @@ class RandomAskApp:
             bd=0,
         )
         canvas.pack(fill="both", expand=True)
-        draw_panel_shell(canvas, width, height, 31, accent=THEME["line"], glow="#063044", fill=THEME["panel"], scan=True)
-        draw_speaker_icon(canvas, 20, 20, 36, color=THEME["ink"], accent=THEME["teal"])
         text_len = len(text.strip())
         canvas.create_text(
-            68,
-            31,
+            24,
+            38,
             anchor="w",
             text=f"已选 {text_len} 字",
             fill=THEME["ink"],
             font=("Microsoft YaHei UI", 10, "bold"),
         )
-        canvas.create_text(
-            68,
-            49,
-            anchor="w",
-            text="BUFFER READY",
-            fill=THEME["muted"],
-            font=("Consolas", 8, "bold"),
-        )
 
-        confirm_btn = StadiumButton(
-            canvas,
-            text="确认",
-            command=lambda: self._confirm_drag_text(text),
-            width=76,
-            height=34,
-            fill="#16331f",
-            active_fill="#1f4a2c",
-            outline=THEME["green"],
-            canvas_bg=THEME["panel"],
-        )
-        cancel_btn = StadiumButton(
-            canvas,
-            text="取消",
-            command=self._cancel_text_confirm_badge,
-            width=76,
-            height=34,
-            fill="#2d1e28",
-            active_fill="#442737",
-            outline=THEME["red"],
-            canvas_bg=THEME["panel"],
-        )
-        canvas.create_window(284, height // 2, window=confirm_btn)
-        canvas.create_window(364, height // 2, window=cancel_btn)
+        canvas.inline_buttons = [  # type: ignore[attr-defined]
+            GlassCanvasButton(
+                canvas,
+                220,
+                height // 2 - 20,
+                92,
+                40,
+                text="确认",
+                command=lambda: self._confirm_drag_text(text),
+                accent="#ffffff",
+                fill=THEME["glass_underlay"],
+                active_fill=THEME["panel_3"],
+            ),
+            GlassCanvasButton(
+                canvas,
+                316,
+                height // 2 - 20,
+                92,
+                40,
+                text="取消",
+                command=self._cancel_text_confirm_badge,
+                accent="#ffffff",
+                fill=THEME["glass_underlay"],
+                active_fill=THEME["panel_3"],
+            ),
+        ]
 
         badge.bind("<Escape>", lambda _event: self._cancel_text_confirm_badge())
         self.text_confirm_badge = badge
         self._position_badge_near_pointer(badge)
+        self._apply_sampled_glass_canvas(badge, canvas, width, height, THEME["line"], 31)
 
     def _position_badge_near_pointer(self, badge: tk.Toplevel) -> None:
         badge.update_idletasks()
@@ -1886,9 +2425,6 @@ class RandomAskApp:
         self._start_request(lambda: llm.ask_text(text, question))
 
     def _start_request(self, work: Callable[[], str]) -> None:
-        self.result_window = ResultWindow(self.root, "正在请求模型，请稍候...")
-        self._center_near_bubble(self.result_window)
-
         def worker() -> None:
             try:
                 answer = work()
@@ -1897,13 +2433,15 @@ class RandomAskApp:
                 self.response_queue.put(("error", traceback.format_exc()))
 
         threading.Thread(target=worker, daemon=True).start()
-        self.root.after(120, self._poll_response)
+        self.result_window = ResultWindow(self.root, "正在请求模型，请稍候...")
+        self._center_near_bubble(self.result_window)
+        self.root.after(60, self._poll_response)
 
     def _poll_response(self) -> None:
         try:
             status, payload = self.response_queue.get_nowait()
         except queue.Empty:
-            self.root.after(120, self._poll_response)
+            self.root.after(60, self._poll_response)
             return
 
         if self.result_window is None or not self.result_window.winfo_exists():
