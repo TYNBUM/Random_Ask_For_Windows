@@ -13,11 +13,12 @@ import math
 import os
 import queue
 import threading
-import time
 import traceback
+from ctypes import wintypes
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import tkinter as tk
 from tkinter import messagebox
@@ -61,6 +62,24 @@ def make_process_dpi_aware() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def begin_high_resolution_timer() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return ctypes.windll.winmm.timeBeginPeriod(1) == 0
+    except Exception:
+        return False
+
+
+def end_high_resolution_timer() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
 
 
 def is_left_mouse_down() -> bool:
@@ -222,6 +241,40 @@ def scaled_alpha(mask: Image.Image, scale: float, cap: int = 255) -> Image.Image
     return mask.point(lambda value: min(cap, int(value * scale)))
 
 
+@lru_cache(maxsize=32)
+def make_liquid_glass_mask_layers(
+    width: int,
+    height: int,
+    shell_rect: tuple[int, int, int, int],
+    shell_radius: int,
+    clean_highlight: bool,
+) -> tuple[Image.Image, Image.Image, Image.Image, Image.Image, Image.Image, Image.Image]:
+    """Build immutable mask layers shared by every frame of a fixed-size glass surface."""
+    mask = make_rounded_mask((width, height), shell_rect, shell_radius)
+    edge_mask = make_edge_mask(mask, max(3, min(width, height) // 6))
+    refraction_alpha = scaled_alpha(edge_mask, 0.88, 218)
+
+    top_gradient = Image.new("L", (width, height), 0)
+    top_draw = ImageDraw.Draw(top_gradient)
+    bottom_gradient = Image.new("L", (width, height), 0)
+    bottom_draw = ImageDraw.Draw(bottom_gradient)
+    for y_pos in range(height):
+        progress = y_pos / max(1, height - 1)
+        top_draw.line((0, y_pos, width, y_pos), fill=int(128 * (1 - progress)))
+        bottom_draw.line((0, y_pos, width, y_pos), fill=int(76 * progress))
+
+    top_alpha = ImageChops.multiply(edge_mask, top_gradient)
+    bottom_alpha = ImageChops.multiply(edge_mask, bottom_gradient)
+    rim_mask = make_fine_rim_mask(mask, 1 if clean_highlight else 2, 0.45 if clean_highlight else 0.65)
+    rim_alpha = scaled_alpha(
+        rim_mask,
+        0.54 if clean_highlight else 0.76,
+        138 if clean_highlight else 204,
+    )
+    binary_mask = mask.point(lambda value: 255 if value >= 128 else 0)
+    return mask, refraction_alpha, top_alpha, bottom_alpha, rim_alpha, binary_mask
+
+
 def create_fallback_backdrop(width: int, height: int) -> Image.Image:
     image = Image.new("RGB", (width, height), THEME["panel_deep"])
     draw = ImageDraw.Draw(image)
@@ -232,6 +285,142 @@ def create_fallback_backdrop(width: int, height: int) -> Image.Image:
     draw.ellipse((-width // 4, -height, width // 2, height), fill="#d3e6ff")
     draw.ellipse((width // 2, height // 4, width + width // 4, height + height // 2), fill="#f2eaff")
     return image
+
+
+class BitmapInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BitmapInfo(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BitmapInfoHeader),
+        ("bmiColors", wintypes.DWORD * 3),
+    ]
+
+
+@lru_cache(maxsize=1)
+def get_gdi_capture_api() -> tuple[Any, Any]:
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.BitBlt.argtypes = [
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+    ]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [
+        wintypes.HDC,
+        wintypes.HBITMAP,
+        wintypes.UINT,
+        wintypes.UINT,
+        wintypes.LPVOID,
+        ctypes.POINTER(BitmapInfo),
+        wintypes.UINT,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    gdi32.DeleteDC.restype = wintypes.BOOL
+    return user32, gdi32
+
+
+def grab_screen_region_gdi(left: int, top: int, width: int, height: int) -> Optional[Image.Image]:
+    if os.name != "nt" or width <= 0 or height <= 0:
+        return None
+    user32, gdi32 = get_gdi_capture_api()
+    screen_dc = user32.GetDC(None)
+    if not screen_dc:
+        return None
+    memory_dc = None
+    bitmap = None
+    previous = None
+    try:
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not memory_dc or not bitmap:
+            return None
+        previous = gdi32.SelectObject(memory_dc, bitmap)
+        source_copy = 0x00CC0020
+        capture_layered_windows = 0x40000000
+        copied = gdi32.BitBlt(
+            memory_dc,
+            0,
+            0,
+            width,
+            height,
+            screen_dc,
+            left,
+            top,
+            source_copy | capture_layered_windows,
+        )
+        if not copied:
+            return None
+
+        bitmap_info = BitmapInfo()
+        bitmap_info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+        bitmap_info.bmiHeader.biWidth = width
+        bitmap_info.bmiHeader.biHeight = -height
+        bitmap_info.bmiHeader.biPlanes = 1
+        bitmap_info.bmiHeader.biBitCount = 32
+        bitmap_info.bmiHeader.biCompression = 0
+        pixel_buffer = (ctypes.c_ubyte * (width * height * 4))()
+        copied_rows = gdi32.GetDIBits(
+            memory_dc,
+            bitmap,
+            0,
+            height,
+            pixel_buffer,
+            ctypes.byref(bitmap_info),
+            0,
+        )
+        if copied_rows != height:
+            return None
+        return Image.frombuffer(
+            "RGB",
+            (width, height),
+            pixel_buffer,
+            "raw",
+            "BGRX",
+            0,
+            1,
+        )
+    finally:
+        if previous:
+            gdi32.SelectObject(memory_dc, previous)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory_dc:
+            gdi32.DeleteDC(memory_dc)
+        user32.ReleaseDC(None, screen_dc)
 
 
 def grab_screen_region(x: int, y: int, width: int, height: int) -> Optional[Image.Image]:
@@ -335,13 +524,20 @@ def make_liquid_glass_bitmap(
         output.alpha_composite(scaled)
         return output.convert("RGB")
 
-    mask = make_rounded_mask((width, height), shell_rect, shell_radius)
-    edge_mask = make_edge_mask(mask, max(3, min(width, height) // 6))
+    mask, refraction_alpha, top_alpha, bottom_alpha, rim_alpha, binary_mask = make_liquid_glass_mask_layers(
+        width,
+        height,
+        shell_rect,
+        shell_radius,
+        clean_highlight,
+    )
 
     if screen_image is None:
         backdrop = create_fallback_backdrop(width, height)
     else:
-        backdrop = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        backdrop = screen_image if screen_image.mode == "RGB" else screen_image.convert("RGB")
+        if backdrop.size != (width, height):
+            backdrop = backdrop.resize((width, height), Image.Resampling.LANCZOS)
 
     # Layer 1: blurred backdrop seen through the capsule.
     glass = backdrop.filter(ImageFilter.GaussianBlur(blur_radius))
@@ -357,107 +553,191 @@ def make_liquid_glass_bitmap(
     refracted = ImageEnhance.Contrast(refracted).enhance(1.16)
     refracted = ImageEnhance.Brightness(refracted).enhance(1.05)
     refracted = refracted.filter(ImageFilter.GaussianBlur(max(1, blur_radius // 5))).convert("RGBA")
-    refracted.putalpha(scaled_alpha(edge_mask, 0.88, 218))
+    refracted.putalpha(refraction_alpha)
     glass.alpha_composite(refracted)
 
     # Layer 2: frosted material tint. Kept deliberately light so the backdrop still reads through it.
-    body = Image.new("RGBA", (width, height), (255, 255, 255, frost_alpha))
-    glass.alpha_composite(body)
+    if frost_alpha > 0:
+        body = Image.new("RGBA", (width, height), (255, 255, 255, frost_alpha))
+        glass.alpha_composite(body)
     tint_rgb = _hex_to_rgb(accent)
-    tint = Image.new("RGBA", (width, height), (*tint_rgb, tint_alpha))
-    glass.alpha_composite(tint)
+    if tint_alpha > 0:
+        tint = Image.new("RGBA", (width, height), (*tint_rgb, tint_alpha))
+        glass.alpha_composite(tint)
 
-    top_alpha = Image.new("L", (width, height), 0)
-    top_draw = ImageDraw.Draw(top_alpha)
-    for y_pos in range(height):
-        top_draw.line((0, y_pos, width, y_pos), fill=int(128 * (1 - y_pos / max(1, height - 1))))
-    top_alpha = ImageChops.multiply(edge_mask, top_alpha)
     edge_light = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     edge_light.putalpha(top_alpha)
     glass.alpha_composite(edge_light)
 
-    bottom_alpha = Image.new("L", (width, height), 0)
-    bottom_draw = ImageDraw.Draw(bottom_alpha)
-    for y_pos in range(height):
-        bottom_draw.line((0, y_pos, width, y_pos), fill=int(76 * (y_pos / max(1, height - 1))))
-    bottom_alpha = ImageChops.multiply(edge_mask, bottom_alpha)
     edge_shadow = Image.new("RGBA", (width, height), (35, 45, 62, 0))
     edge_shadow.putalpha(bottom_alpha)
     glass.alpha_composite(edge_shadow)
 
     # Layer 3: specular highlights and refractive edge catches.
-    rim_mask = make_fine_rim_mask(mask, 1 if clean_highlight else 2, 0.45 if clean_highlight else 0.65)
-    rim_alpha = scaled_alpha(rim_mask, 0.54 if clean_highlight else 0.76, 138 if clean_highlight else 204)
     rim = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     rim.putalpha(rim_alpha)
     glass.alpha_composite(rim)
 
-    shine = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(shine)
-    if clean_highlight:
-        pass
-    elif compact_highlight:
-        draw.line(
-            (
-                shell_rect[0] + 12,
-                shell_rect[1] + 9,
-                shell_rect[2] - 12,
-                shell_rect[1] + 7,
-            ),
-            fill=(255, 255, 255, 150),
-            width=2,
-        )
-        draw.line(
-            (
-                shell_rect[0] + 16,
-                shell_rect[3] - 8,
-                shell_rect[2] - 16,
-                shell_rect[3] - 9,
-            ),
-            fill=(*tint_rgb, 70),
-            width=1,
-        )
-    else:
-        draw.rounded_rectangle(
-            (shell_rect[0] + 3, shell_rect[1] + 3, shell_rect[2] - 3, shell_rect[3] - 3),
-            radius=max(1, shell_radius - 3),
-            outline=(255, 255, 255, 118),
-            width=1,
-        )
-        draw.arc(
-            (shell_rect[0] + 7, shell_rect[1] + 7, shell_rect[0] + 118, shell_rect[3] - 5),
-            start=102,
-            end=248,
-            fill=(255, 255, 255, 210),
-            width=3,
-        )
-        draw.arc(
-            (shell_rect[2] - 132, shell_rect[1] + 8, shell_rect[2] - 8, shell_rect[3] - 4),
-            start=292,
-            end=24,
-            fill=(*tint_rgb, 136),
-            width=2,
-        )
-        draw.line(
-            (shell_rect[0] + 38, shell_rect[1] + 12, shell_rect[2] - 44, shell_rect[1] + 9),
-            fill=(255, 255, 255, 170),
-            width=2,
-        )
-        draw.line(
-            (shell_rect[0] + 54, shell_rect[3] - 10, shell_rect[2] - 62, shell_rect[3] - 13),
-            fill=(*tint_rgb, 92),
-            width=2,
-        )
-    glass.alpha_composite(shine)
+    if not clean_highlight:
+        shine = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(shine)
+        if compact_highlight:
+            draw.line(
+                (
+                    shell_rect[0] + 12,
+                    shell_rect[1] + 9,
+                    shell_rect[2] - 12,
+                    shell_rect[1] + 7,
+                ),
+                fill=(255, 255, 255, 150),
+                width=2,
+            )
+            draw.line(
+                (
+                    shell_rect[0] + 16,
+                    shell_rect[3] - 8,
+                    shell_rect[2] - 16,
+                    shell_rect[3] - 9,
+                ),
+                fill=(*tint_rgb, 70),
+                width=1,
+            )
+        else:
+            draw.rounded_rectangle(
+                (shell_rect[0] + 3, shell_rect[1] + 3, shell_rect[2] - 3, shell_rect[3] - 3),
+                radius=max(1, shell_radius - 3),
+                outline=(255, 255, 255, 118),
+                width=1,
+            )
+            draw.arc(
+                (shell_rect[0] + 7, shell_rect[1] + 7, shell_rect[0] + 118, shell_rect[3] - 5),
+                start=102,
+                end=248,
+                fill=(255, 255, 255, 210),
+                width=3,
+            )
+            draw.arc(
+                (shell_rect[2] - 132, shell_rect[1] + 8, shell_rect[2] - 8, shell_rect[3] - 4),
+                start=292,
+                end=24,
+                fill=(*tint_rgb, 136),
+                width=2,
+            )
+            draw.line(
+                (shell_rect[0] + 38, shell_rect[1] + 12, shell_rect[2] - 44, shell_rect[1] + 9),
+                fill=(255, 255, 255, 170),
+                width=2,
+            )
+            draw.line(
+                (shell_rect[0] + 54, shell_rect[3] - 10, shell_rect[2] - 62, shell_rect[3] - 13),
+                fill=(*tint_rgb, 92),
+                width=2,
+            )
+        glass.alpha_composite(shine)
 
     glass.putalpha(mask)
     if transparent_outside:
         return glass
-    mask = mask.point(lambda value: 255 if value >= 128 else 0)
-    glass.putalpha(mask)
+    glass.putalpha(binary_mask)
     output = Image.new("RGBA", (width, height), (*transparent_rgb, 255))
     output.alpha_composite(glass)
     return output.convert("RGB")
+
+
+@dataclass(slots=True)
+class BubbleGlassRenderRequest:
+    generation: int
+    backdrop: Image.Image
+    width: int
+    height: int
+    button_specs: tuple[tuple[int, int, int, int], ...]
+    handle_spec: tuple[int, int, int]
+
+
+@dataclass(slots=True)
+class BubbleGlassFrame:
+    generation: int
+    backdrop: Image.Image
+    bubble_bitmap: Image.Image
+    button_bitmaps: tuple[Image.Image, ...]
+    handle_bitmap: Image.Image
+
+
+@dataclass(slots=True)
+class BubbleGlassRenderResult:
+    generation: int
+    frame: Optional[BubbleGlassFrame] = None
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class DragScreenSnapshotResult:
+    session: int
+    snapshot: Optional[Image.Image]
+    origin: tuple[int, int]
+
+
+def render_bubble_glass_frame(request: BubbleGlassRenderRequest) -> BubbleGlassFrame:
+    backdrop = request.backdrop if request.backdrop.mode == "RGB" else request.backdrop.convert("RGB")
+    if backdrop.size != (request.width, request.height):
+        backdrop = backdrop.resize((request.width, request.height), Image.Resampling.LANCZOS)
+
+    bubble_bitmap = make_liquid_glass_bitmap(
+        request.width,
+        request.height,
+        backdrop,
+        accent="#ffffff",
+        tint_alpha=0,
+        clean_highlight=True,
+    )
+    button_bitmaps = tuple(
+        make_liquid_glass_bitmap(
+            button_width,
+            button_height,
+            backdrop.crop((x, y, x + button_width, y + button_height)),
+            accent="#ffffff",
+            transparent_outside=True,
+            radius=button_height // 2,
+            blur_radius=20,
+            frost_alpha=72,
+            tint_alpha=0,
+            brightness=1.2,
+            compact_highlight=True,
+            clean_highlight=True,
+        )
+        for x, y, button_width, button_height in request.button_specs
+    )
+
+    handle_left, handle_top, handle_size = request.handle_spec
+    handle_bitmap = make_liquid_glass_bitmap(
+        handle_size,
+        handle_size,
+        backdrop.crop(
+            (
+                handle_left,
+                handle_top,
+                handle_left + handle_size,
+                handle_top + handle_size,
+            )
+        ),
+        accent="#ffffff",
+        transparent_outside=True,
+        radius=handle_size // 2 - 3,
+        blur_radius=18,
+        frost_alpha=34,
+        tint_alpha=0,
+        brightness=1.12,
+        compact_highlight=True,
+        clean_highlight=True,
+        shell_rect_override=(3, 3, handle_size - 3, handle_size - 3),
+    )
+    return BubbleGlassFrame(
+        generation=request.generation,
+        backdrop=backdrop,
+        bubble_bitmap=bubble_bitmap,
+        button_bitmaps=button_bitmaps,
+        handle_bitmap=handle_bitmap,
+    )
 
 
 def draw_liquid_glass_round_rect(
@@ -758,6 +1038,7 @@ class GlassCanvasButton:
         self.backdrop = backdrop
         self.image_ref: Optional[ImageTk.PhotoImage] = None
         self.tag = f"glass_button_{id(self)}"
+        self.image_tag = f"{self.tag}_image"
         self.hover = False
         self.pressed = False
         self._draw()
@@ -771,27 +1052,35 @@ class GlassCanvasButton:
         for item in after - before:
             self.canvas.addtag_withtag(self.tag, item)
 
-    def _draw(self) -> None:
+    def _draw(self, rendered_bitmap: Optional[Image.Image] = None) -> None:
         self.canvas.delete(self.tag)
         before = set(self.canvas.find_all())
         if self.backdrop is not None:
-            crop = self.backdrop.crop((self.x, self.y, self.x + self.width, self.y + self.height))
-            bitmap = make_liquid_glass_bitmap(
-                self.width,
-                self.height,
-                crop,
-                accent="#ffffff",
-                transparent_outside=True,
-                radius=self.height // 2,
-                blur_radius=20,
-                frost_alpha=72,
-                tint_alpha=0,
-                brightness=1.2,
-                compact_highlight=True,
-                clean_highlight=True,
-            )
+            bitmap = rendered_bitmap
+            if bitmap is None:
+                crop = self.backdrop.crop((self.x, self.y, self.x + self.width, self.y + self.height))
+                bitmap = make_liquid_glass_bitmap(
+                    self.width,
+                    self.height,
+                    crop,
+                    accent="#ffffff",
+                    transparent_outside=True,
+                    radius=self.height // 2,
+                    blur_radius=20,
+                    frost_alpha=72,
+                    tint_alpha=0,
+                    brightness=1.2,
+                    compact_highlight=True,
+                    clean_highlight=True,
+                )
             self.image_ref = ImageTk.PhotoImage(bitmap)
-            self.canvas.create_image(self.x, self.y, anchor="nw", image=self.image_ref, tags=(self.tag,))
+            self.canvas.create_image(
+                self.x,
+                self.y,
+                anchor="nw",
+                image=self.image_ref,
+                tags=(self.tag, self.image_tag),
+            )
         else:
             fill = self.active_fill if self.hover else self.fill
             if self.pressed:
@@ -839,6 +1128,16 @@ class GlassCanvasButton:
     def set_backdrop(self, backdrop: Image.Image) -> None:
         self.backdrop = backdrop
         self._draw()
+
+    def set_rendered_backdrop(self, backdrop: Image.Image, bitmap: Image.Image) -> None:
+        self.backdrop = backdrop
+        image_items = self.canvas.find_withtag(self.image_tag)
+        if not image_items:
+            self._draw(bitmap)
+            return
+        self.image_ref = ImageTk.PhotoImage(bitmap)
+        for image_item in image_items:
+            self.canvas.itemconfigure(image_item, image=self.image_ref)
 
 
 class GlassScrollBar(tk.Canvas):
@@ -1768,18 +2067,39 @@ class RandomAskApp:
         self.clipboard_seq_before: Optional[int] = None
         self.drag_start_x = 0
         self.drag_start_y = 0
+        self._bubble_drag_position = (120, initial_y)
         self._bubble_moved = False
         self._drag_screen_snapshot: Optional[Image.Image] = None
         self._drag_screen_origin = (0, 0)
-        self._last_drag_glass_update = 0.0
-        self._drag_glass_update_pending = False
+        self._drag_snapshot_session = 0
+        self._drag_snapshot_capture_pending = False
+        self._drag_snapshot_final_render_pending = False
+        self._drag_in_progress = False
+        self._drag_snapshot_results: queue.Queue[DragScreenSnapshotResult] = queue.Queue()
+        self._drag_snapshot_poll_after_id: Optional[str] = None
+        self._drag_timer_resolution_active = False
+        self._drawer_reposition_after_id: Optional[str] = None
+        self._bubble_render_requests: queue.Queue[Optional[BubbleGlassRenderRequest]] = queue.Queue(maxsize=1)
+        self._bubble_render_results: queue.Queue[BubbleGlassRenderResult] = queue.Queue(maxsize=2)
+        self._bubble_render_generation = 0
+        self._bubble_render_latest_requested = 0
+        self._bubble_render_latest_completed = 0
+        self._bubble_render_latest_applied = 0
+        self._bubble_render_poll_after_id: Optional[str] = None
+        self._bubble_renderer_closed = False
+        self._bubble_render_error_reported = False
+        self._bubble_render_thread: Optional[threading.Thread] = None
         self.tray_icon = None
 
         self._build_bubble()
+        self._start_bubble_renderer()
         self._setup_tray_icon()
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self._stop_bubble_renderer()
 
     def _setup_tray_icon(self) -> None:
         if pystray is None:
@@ -1809,6 +2129,7 @@ class RandomAskApp:
         return image
 
     def quit_app(self) -> None:
+        self._stop_bubble_renderer()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -1816,6 +2137,89 @@ class RandomAskApp:
                 pass
             self.tray_icon = None
         self.root.destroy()
+
+    def _start_bubble_renderer(self) -> None:
+        self._bubble_render_thread = threading.Thread(
+            target=self._bubble_render_worker,
+            name="bubble-glass-renderer",
+            daemon=True,
+        )
+        self._bubble_render_thread.start()
+
+    def _bubble_render_worker(self) -> None:
+        while True:
+            request = self._bubble_render_requests.get()
+            if request is None:
+                return
+
+            # A drag can produce hundreds of positions per second. Render only the newest one.
+            while True:
+                try:
+                    newer_request = self._bubble_render_requests.get_nowait()
+                except queue.Empty:
+                    break
+                if newer_request is None:
+                    return
+                request = newer_request
+
+            try:
+                result = BubbleGlassRenderResult(
+                    generation=request.generation,
+                    frame=render_bubble_glass_frame(request),
+                )
+            except Exception:
+                result = BubbleGlassRenderResult(
+                    generation=request.generation,
+                    error=traceback.format_exc(),
+                )
+            self._put_latest_bubble_render_result(result)
+
+    def _put_latest_bubble_render_result(self, result: BubbleGlassRenderResult) -> None:
+        while True:
+            try:
+                self._bubble_render_results.put_nowait(result)
+                return
+            except queue.Full:
+                try:
+                    self._bubble_render_results.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _stop_bubble_renderer(self) -> None:
+        if self._bubble_renderer_closed:
+            return
+        self._bubble_renderer_closed = True
+        if self._drag_timer_resolution_active:
+            end_high_resolution_timer()
+            self._drag_timer_resolution_active = False
+        self._drag_snapshot_session += 1
+        self._drag_snapshot_capture_pending = False
+        for after_id_name in (
+            "_bubble_render_poll_after_id",
+            "_drag_snapshot_poll_after_id",
+            "_drawer_reposition_after_id",
+        ):
+            after_id = getattr(self, after_id_name, None)
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, after_id_name, None)
+
+        while True:
+            try:
+                self._bubble_render_requests.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._bubble_render_requests.put_nowait(None)
+        except queue.Full:
+            pass
+        render_thread = self._bubble_render_thread
+        if render_thread is not None and render_thread.is_alive():
+            render_thread.join(timeout=0.2)
+        self._bubble_render_thread = None
 
     def _capture_bubble_backdrop(self, width: int, height: int, hide_window: bool = False) -> Optional[Image.Image]:
         self.root.update_idletasks()
@@ -1855,7 +2259,12 @@ class RandomAskApp:
         if screen_image is None:
             self.bubble_screen_image = create_fallback_backdrop(width, height)
         else:
-            self.bubble_screen_image = screen_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+            self.bubble_screen_image = screen_image if screen_image.mode == "RGB" else screen_image.convert("RGB")
+            if self.bubble_screen_image.size != (width, height):
+                self.bubble_screen_image = self.bubble_screen_image.resize(
+                    (width, height),
+                    Image.Resampling.LANCZOS,
+                )
         bitmap = make_liquid_glass_bitmap(
             width,
             height,
@@ -1864,14 +2273,34 @@ class RandomAskApp:
             tint_alpha=0,
             clean_highlight=True,
         )
-        self.bubble_glass_ref = ImageTk.PhotoImage(bitmap)
-        self.bubble_canvas.delete("bubble_glass")
-        self.bubble_canvas.create_image(0, 0, anchor="nw", image=self.bubble_glass_ref, tags=("bubble_glass",))
-        self.bubble_canvas.tag_lower("bubble_glass")
+        self._set_bubble_canvas_bitmap(bitmap)
         for button in getattr(self, "main_buttons", []):
             button.set_backdrop(self.bubble_screen_image)
         if hasattr(self, "drag_handle_ref"):
             self._draw_drag_handle()
+
+    def _set_bubble_canvas_bitmap(self, bitmap: Image.Image) -> None:
+        self.bubble_glass_ref = ImageTk.PhotoImage(bitmap)
+        glass_items = self.bubble_canvas.find_withtag("bubble_glass")
+        if glass_items:
+            for glass_item in glass_items:
+                self.bubble_canvas.itemconfigure(glass_item, image=self.bubble_glass_ref)
+            return
+        self.bubble_canvas.create_image(
+            0,
+            0,
+            anchor="nw",
+            image=self.bubble_glass_ref,
+            tags=("bubble_glass",),
+        )
+        self.bubble_canvas.tag_lower("bubble_glass")
+
+    def _apply_bubble_glass_frame(self, frame: BubbleGlassFrame) -> None:
+        self.bubble_screen_image = frame.backdrop
+        self._set_bubble_canvas_bitmap(frame.bubble_bitmap)
+        for button, bitmap in zip(getattr(self, "main_buttons", []), frame.button_bitmaps):
+            button.set_rendered_backdrop(frame.backdrop, bitmap)
+        self._draw_drag_handle(frame.handle_bitmap)
 
     def _apply_sampled_glass_canvas(
         self,
@@ -1919,36 +2348,99 @@ class RandomAskApp:
         for button in getattr(canvas, "inline_buttons", []):
             button.set_backdrop(canvas.sampled_glass_screen_image)  # type: ignore[attr-defined]
 
-    def _capture_drag_screen_snapshot(self) -> None:
+    def _start_drag_screen_snapshot_capture(self) -> None:
         left, top, width, height = get_virtual_screen_bounds(self.root)
-        try:
-            try:
-                snapshot = ImageGrab.grab(bbox=(left, top, left + width, top + height), all_screens=True)
-            except TypeError:
-                snapshot = ImageGrab.grab(bbox=(left, top, left + width, top + height))
-        except Exception:
-            snapshot = None
-        if snapshot is None:
-            self._drag_screen_snapshot = None
-            self._drag_screen_origin = (0, 0)
-            return
-        self._drag_screen_snapshot = snapshot.convert("RGB")
+        self._drag_snapshot_session += 1
+        session = self._drag_snapshot_session
+        self._drag_snapshot_capture_pending = True
+        self._drag_screen_snapshot = None
         self._drag_screen_origin = (left, top)
+        threading.Thread(
+            target=self._capture_drag_screen_snapshot_worker,
+            args=(session, left, top, width, height),
+            name="drag-screen-capture",
+            daemon=True,
+        ).start()
+        self._ensure_drag_snapshot_poll()
 
-    def _refresh_bubble_glass_from_drag_snapshot(self, force: bool = False) -> None:
+    def _capture_drag_screen_snapshot_worker(
+        self,
+        session: int,
+        left: int,
+        top: int,
+        width: int,
+        height: int,
+    ) -> None:
+        snapshot = None
+        try:
+            snapshot = grab_screen_region_gdi(left, top, width, height)
+            if snapshot is None:
+                try:
+                    snapshot = ImageGrab.grab(
+                        bbox=(left, top, left + width, top + height),
+                        all_screens=True,
+                    )
+                except TypeError:
+                    snapshot = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+        except Exception:
+            pass
+        if snapshot is not None and snapshot.mode != "RGB":
+            snapshot = snapshot.convert("RGB")
+        self._drag_snapshot_results.put(
+            DragScreenSnapshotResult(
+                session=session,
+                snapshot=snapshot,
+                origin=(left, top),
+            )
+        )
+
+    def _ensure_drag_snapshot_poll(self) -> None:
+        if self._bubble_renderer_closed or self._drag_snapshot_poll_after_id is not None:
+            return
+        self._drag_snapshot_poll_after_id = self.root.after(4, self._poll_drag_snapshot_results)
+
+    def _poll_drag_snapshot_results(self) -> None:
+        self._drag_snapshot_poll_after_id = None
+        newest_result: Optional[DragScreenSnapshotResult] = None
+        while True:
+            try:
+                result = self._drag_snapshot_results.get_nowait()
+            except queue.Empty:
+                break
+            if result.session == self._drag_snapshot_session:
+                newest_result = result
+
+        if newest_result is not None:
+            self._drag_snapshot_capture_pending = False
+            self._drag_screen_snapshot = newest_result.snapshot
+            self._drag_screen_origin = newest_result.origin
+            if self._drag_screen_snapshot is not None and self._drag_in_progress and self._bubble_moved:
+                self._refresh_bubble_glass_from_drag_snapshot(position=self._bubble_drag_position)
+            elif self._drag_screen_snapshot is not None and self._drag_snapshot_final_render_pending:
+                self._refresh_bubble_glass_from_drag_snapshot(
+                    position=self._bubble_drag_position,
+                )
+                self._drag_snapshot_final_render_pending = False
+                self._drag_screen_snapshot = None
+            elif not self._drag_in_progress:
+                self._drag_screen_snapshot = None
+                self._drag_snapshot_final_render_pending = False
+
+        if not self._bubble_renderer_closed and self._drag_snapshot_capture_pending:
+            self._ensure_drag_snapshot_poll()
+
+    def _refresh_bubble_glass_from_drag_snapshot(
+        self,
+        position: Optional[tuple[int, int]] = None,
+    ) -> None:
         snapshot = self._drag_screen_snapshot
-        if snapshot is None:
+        if snapshot is None or self._bubble_renderer_closed:
             return
-        now = time.monotonic()
-        if not force and now - self._last_drag_glass_update < 0.033:
-            if not self._drag_glass_update_pending:
-                self._drag_glass_update_pending = True
-                self.root.after(16, self._run_pending_drag_glass_update)
-            return
-        self._drag_glass_update_pending = False
-        self._last_drag_glass_update = now
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
+        if position is None:
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+        else:
+            x, y = position
         crop = crop_from_screen_snapshot(
             snapshot,
             self._drag_screen_origin,
@@ -1957,13 +2449,70 @@ class RandomAskApp:
             self.bubble_width,
             self.bubble_height,
         )
-        self._set_bubble_glass_from_image(crop)
+        self._bubble_render_generation += 1
+        generation = self._bubble_render_generation
+        request = BubbleGlassRenderRequest(
+            generation=generation,
+            backdrop=crop,
+            width=self.bubble_width,
+            height=self.bubble_height,
+            button_specs=tuple(
+                (button.x, button.y, button.width, button.height)
+                for button in getattr(self, "main_buttons", [])
+            ),
+            handle_spec=(8, 9, 44),
+        )
+        self._bubble_render_latest_requested = generation
+        self._put_latest_bubble_render_request(request)
+        self._ensure_bubble_render_poll()
 
-    def _run_pending_drag_glass_update(self) -> None:
-        if not self._bubble_moved:
-            self._drag_glass_update_pending = False
+    def _put_latest_bubble_render_request(self, request: BubbleGlassRenderRequest) -> None:
+        while not self._bubble_renderer_closed:
+            try:
+                self._bubble_render_requests.put_nowait(request)
+                return
+            except queue.Full:
+                try:
+                    self._bubble_render_requests.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _ensure_bubble_render_poll(self) -> None:
+        if self._bubble_renderer_closed or self._bubble_render_poll_after_id is not None:
             return
-        self._refresh_bubble_glass_from_drag_snapshot(force=True)
+        self._bubble_render_poll_after_id = self.root.after(8, self._poll_bubble_render_results)
+
+    def _poll_bubble_render_results(self) -> None:
+        self._bubble_render_poll_after_id = None
+        newest_frame: Optional[BubbleGlassFrame] = None
+        while True:
+            try:
+                result = self._bubble_render_results.get_nowait()
+            except queue.Empty:
+                break
+            self._bubble_render_latest_completed = max(
+                self._bubble_render_latest_completed,
+                result.generation,
+            )
+            if result.error is not None:
+                if not self._bubble_render_error_reported:
+                    print("Bubble glass background rendering failed:\n" + result.error)
+                    self._bubble_render_error_reported = True
+                continue
+            if result.frame is not None and (
+                newest_frame is None or result.frame.generation > newest_frame.generation
+            ):
+                newest_frame = result.frame
+
+        if newest_frame is not None and newest_frame.generation > self._bubble_render_latest_applied:
+            self._apply_bubble_glass_frame(newest_frame)
+            self._bubble_render_latest_applied = newest_frame.generation
+
+        if (
+            not self._bubble_renderer_closed
+            and self._bubble_render_latest_completed < self._bubble_render_latest_requested
+        ):
+            self._ensure_bubble_render_poll()
 
     def _build_bubble(self) -> None:
         width = 372
@@ -2032,63 +2581,107 @@ class RandomAskApp:
             ),
         ]
 
-    def _draw_drag_handle(self) -> None:
+    def _draw_drag_handle(self, rendered_bitmap: Optional[Image.Image] = None) -> None:
         canvas = self.bubble_canvas
-        canvas.delete("drag_handle")
         cx = 30
         cy = 31
         size = 44
         left = cx - size // 2
         top = cy - size // 2
-        backdrop = getattr(self, "bubble_screen_image", None)
-        if backdrop is not None:
-            crop = backdrop.crop((left, top, left + size, top + size))
-        else:
-            crop = create_fallback_backdrop(size, size)
-        bitmap = make_liquid_glass_bitmap(
-            size,
-            size,
-            crop,
-            accent="#ffffff",
-            transparent_outside=True,
-            radius=size // 2 - 3,
-            blur_radius=18,
-            frost_alpha=34,
-            tint_alpha=0,
-            brightness=1.12,
-            compact_highlight=True,
-            clean_highlight=True,
-            shell_rect_override=(3, 3, size - 3, size - 3),
-        )
+        if rendered_bitmap is not None:
+            self.drag_handle_ref = ImageTk.PhotoImage(rendered_bitmap)
+            handle_items = canvas.find_withtag("drag_handle")
+            if handle_items:
+                for handle_item in handle_items:
+                    canvas.itemconfigure(handle_item, image=self.drag_handle_ref)
+                return
+
+        canvas.delete("drag_handle")
+        bitmap = rendered_bitmap
+        if bitmap is None:
+            backdrop = getattr(self, "bubble_screen_image", None)
+            if backdrop is not None:
+                crop = backdrop.crop((left, top, left + size, top + size))
+            else:
+                crop = create_fallback_backdrop(size, size)
+            bitmap = make_liquid_glass_bitmap(
+                size,
+                size,
+                crop,
+                accent="#ffffff",
+                transparent_outside=True,
+                radius=size // 2 - 3,
+                blur_radius=18,
+                frost_alpha=34,
+                tint_alpha=0,
+                brightness=1.12,
+                compact_highlight=True,
+                clean_highlight=True,
+                shell_rect_override=(3, 3, size - 3, size - 3),
+            )
         self.drag_handle_ref = ImageTk.PhotoImage(bitmap)
         canvas.create_image(left, top, anchor="nw", image=self.drag_handle_ref, tags=("drag_handle",))
         canvas.tag_bind("drag_handle", "<ButtonPress-1>", self._start_move)
         canvas.tag_bind("drag_handle", "<B1-Motion>", self._on_move)
 
-    def _start_move(self, event: tk.Event) -> None:
+    def _start_move(self, event: tk.Event) -> str:
         self.drag_start_x = event.x
         self.drag_start_y = event.y
         self._bubble_moved = False
-        self._drag_glass_update_pending = False
-        self._last_drag_glass_update = 0.0
-        self._capture_drag_screen_snapshot()
+        self._drag_in_progress = True
+        self._drag_snapshot_final_render_pending = False
+        self._bubble_drag_position = (self.root.winfo_x(), self.root.winfo_y())
+        if not self._drag_timer_resolution_active:
+            self._drag_timer_resolution_active = begin_high_resolution_timer()
+        self._start_drag_screen_snapshot_capture()
+        return "break"
 
-    def _on_move(self, event: tk.Event) -> None:
-        x = self.root.winfo_pointerx() - self.drag_start_x
-        y = self.root.winfo_pointery() - self.drag_start_y
+    def _on_move(self, event: tk.Event) -> str:
+        x = event.x_root - self.drag_start_x
+        y = event.y_root - self.drag_start_y
+        if (x, y) == self._bubble_drag_position:
+            return "break"
         self.root.geometry(f"+{x}+{y}")
+        self._bubble_drag_position = (x, y)
         self._bubble_moved = True
-        self._refresh_bubble_glass_from_drag_snapshot()
-        self._reposition_open_drawers()
+        self._refresh_bubble_glass_from_drag_snapshot(position=(x, y))
+        self._schedule_reposition_open_drawers()
+        return "break"
 
-    def _finish_move(self, _event: tk.Event) -> None:
+    def _finish_move(self, _event: tk.Event) -> str:
+        if self._drag_timer_resolution_active:
+            end_high_resolution_timer()
+            self._drag_timer_resolution_active = False
+        self._drag_in_progress = False
         if not self._bubble_moved:
-            return
-        self._refresh_bubble_glass_from_drag_snapshot(force=True)
+            self._drag_screen_snapshot = None
+            self._drag_snapshot_final_render_pending = False
+            return "break"
+        if self._drag_screen_snapshot is not None:
+            self._refresh_bubble_glass_from_drag_snapshot(
+                position=self._bubble_drag_position,
+            )
+            self._drag_screen_snapshot = None
+        else:
+            self._drag_snapshot_final_render_pending = self._drag_snapshot_capture_pending
         self._bubble_moved = False
-        self._drag_screen_snapshot = None
-        self._drag_glass_update_pending = False
+        if self._drawer_reposition_after_id is not None:
+            self.root.after_cancel(self._drawer_reposition_after_id)
+            self._drawer_reposition_after_id = None
+        self._reposition_open_drawers()
         self.root.after(160, self._refresh_open_drawer_glass)
+        return "break"
+
+    def _schedule_reposition_open_drawers(self) -> None:
+        if self._drawer_reposition_after_id is not None:
+            return
+        if not getattr(self.root, "_drawer_windows", []):
+            return
+        self._drawer_reposition_after_id = self.root.after(8, self._run_scheduled_drawer_reposition)
+
+    def _run_scheduled_drawer_reposition(self) -> None:
+        self._drawer_reposition_after_id = None
+        self._reposition_open_drawers()
 
     def _reposition_open_drawers(self) -> None:
         drawers = list(getattr(self.root, "_drawer_windows", []))
